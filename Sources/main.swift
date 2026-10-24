@@ -16,20 +16,63 @@ func cameraDevices() -> [AVCaptureDevice] {
 }
 
 final class PreviewView: NSView {
-    let previewLayer = AVCaptureVideoPreviewLayer()
+    let displayLayer = AVSampleBufferDisplayLayer()
+    private let sampleLock = NSLock()
+    private var pendingSample: CMSampleBuffer?
+    private var presentationSize = CGSize.zero
+
+    var displayedVideoRect: CGRect {
+        guard presentationSize.width > 0, presentationSize.height > 0 else { return .zero }
+        return AVMakeRect(aspectRatio: presentationSize, insideRect: bounds)
+    }
+
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
-        previewLayer.videoGravity = .resizeAspect
-        layer?.addSublayer(previewLayer)
+        displayLayer.videoGravity = .resizeAspect
+        layer?.addSublayer(displayLayer)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    func enqueue(_ sample: CMSampleBuffer) {
+        sampleLock.lock()
+        let schedule = pendingSample == nil
+        pendingSample = sample
+        sampleLock.unlock()
+        guard schedule else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.sampleLock.lock()
+            let latest = self.pendingSample
+            self.pendingSample = nil
+            self.sampleLock.unlock()
+            guard let latest, let format = CMSampleBufferGetFormatDescription(latest) else { return }
+            let renderer = self.displayLayer.sampleBufferRenderer
+            if renderer.status == .failed {
+                renderer.flush(removingDisplayedImage: true, completionHandler: nil)
+                return
+            }
+            guard renderer.isReadyForMoreMediaData else { return }
+            var copy: CMSampleBuffer?
+            guard CMSampleBufferCreateCopy(allocator: kCFAllocatorDefault, sampleBuffer: latest, sampleBufferOut: &copy) == noErr, let copy else { return }
+            if let attachments = CMSampleBufferGetSampleAttachmentsArray(copy, createIfNecessary: true) as? [NSMutableDictionary] {
+                attachments.first?[kCMSampleAttachmentKey_DisplayImmediately] = true
+            }
+            self.presentationSize = CMVideoFormatDescriptionGetPresentationDimensions(format, usePixelAspectRatio: true, useCleanAperture: true)
+            renderer.enqueue(copy)
+        }
+    }
+
+    func setMirrored(_ enabled: Bool) {
+        displayLayer.setAffineTransform(enabled ? CGAffineTransform(scaleX: -1, y: 1) : .identity)
+    }
+
     override func layout() {
         super.layout()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        previewLayer.frame = bounds
+        displayLayer.frame = bounds
         CATransaction.commit()
     }
 }
@@ -39,6 +82,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let camera = CameraController()
     private let preview = PreviewView(frame: .zero)
     private let picker = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let picturePicker = NSPopUpButton(frame: .zero, pullsDown: false)
+    private var pictureModes: [CameraPictureMode] = []
+    private var selectedPictureMode: CameraPictureMode?
+    private var latestVideoWidth: Int32 = 0
+    private var latestVideoHeight: Int32 = 0
+    private var pictureTestDirectory: URL?
     private let mirror = NSButton(checkboxWithTitle: "镜像", target: nil, action: nil)
     private let recordButton = NSButton(title: "开始录制", target: nil, action: nil)
     private let recordAudio = NSButton(checkboxWithTitle: "录入声音", target: nil, action: nil)
@@ -85,6 +134,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let index = CommandLine.arguments.firstIndex(of: "--recording-e2e"), CommandLine.arguments.indices.contains(index + 1) {
             recordingTestDirectory = URL(fileURLWithPath: CommandLine.arguments[index + 1])
         }
+        if let index = CommandLine.arguments.firstIndex(of: "--picture-mode-e2e"), CommandLine.arguments.indices.contains(index + 1) {
+            pictureTestDirectory = URL(fileURLWithPath: CommandLine.arguments[index + 1])
+        }
         if let index = CommandLine.arguments.firstIndex(of: "--check-ui"),
            CommandLine.arguments.indices.contains(index + 1) {
             let root = window.contentView!
@@ -101,9 +153,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 exit(1)
             }
         }
-        preview.previewLayer.session = camera.session
+        camera.onSampleBuffer = { [weak self] sample in self?.preview.enqueue(sample) }
         camera.onFrame = { [weak self] width, height, fps in
             guard let self, self.selectedID != nil else { return }
+            if let expected = self.selectedPictureMode?.dimensions, (expected.width != width || expected.height != height) { return }
+            self.latestVideoWidth = width
+            self.latestVideoHeight = height
             if self.awaitingFrames { NSLog("Camera preview verified: %d x %d; first video frame received.", width, height) }
             self.lastFrameAt = Date()
             self.awaitingFrames = false
@@ -137,6 +192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.recordingTime.stringValue = String(format: "%02d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
         }
         if recordingTestDirectory != nil { runRecordingE2E() }
+        if pictureTestDirectory != nil { runPictureModeE2E() }
     }
 
     private func buildMenu() {
@@ -163,7 +219,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "WireCamera"
         window.delegate = self
-        window.minSize = NSSize(width: 780, height: 500)
+        window.minSize = NSSize(width: 940, height: 500)
         window.collectionBehavior = [.fullScreenPrimary]
         window.appearance = NSAppearance(named: .darkAqua)
         window.backgroundColor = NSColor(calibratedWhite: 0.075, alpha: 1)
@@ -190,12 +246,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         picker.action = #selector(selectCamera)
         picker.toolTip = "选择摄像头，默认优先使用外接 USB 摄像头"
         picker.setAccessibilityLabel("摄像头")
+        picturePicker.target = self
+        picturePicker.action = #selector(selectPictureMode)
+        picturePicker.setAccessibilityLabel("画面比例")
+        picturePicker.toolTip = "选择摄像头原生画面比例，预览与录制同步切换"
+        picturePicker.addItem(withTitle: "画面比例")
+        picturePicker.isEnabled = false
         mirror.target = self
         mirror.action = #selector(toggleMirror)
         let fullscreen = NSButton(title: "全屏", target: self, action: #selector(toggleFullscreen))
         fullscreen.bezelStyle = .rounded
-        let controls = NSStackView(views: [picker, mirror, fullscreen])
-        controls.spacing = 16
+        let controls = NSStackView(views: [picker, picturePicker, mirror, fullscreen])
+        controls.spacing = 12
         for view in [brand, controls] {
             view.translatesAutoresizingMaskIntoConstraints = false
             header.addSubview(view)
@@ -279,7 +341,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             controls.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -24),
             controls.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             controls.leadingAnchor.constraint(greaterThanOrEqualTo: brand.trailingAnchor, constant: 24),
-            picker.widthAnchor.constraint(equalToConstant: 290),
+            picker.widthAnchor.constraint(equalToConstant: 250),
+            picturePicker.widthAnchor.constraint(equalToConstant: 190),
             preview.topAnchor.constraint(equalTo: header.bottomAnchor),
             preview.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             preview.trailingAnchor.constraint(equalTo: root.trailingAnchor),
@@ -353,13 +416,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard !recordingBusy else { return }
         generation += 1
         let request = generation
+        let previousMode = selectedID == device.uniqueID ? selectedPictureMode?.identifier : nil
+        pictureModes = CameraPictureMode.available(for: device)
+        picturePicker.removeAllItems()
+        pictureModes.forEach { picturePicker.addItem(withTitle: $0.title) }
+        let selectedIndex = pictureModes.firstIndex { $0.identifier == previousMode } ?? 0
+        selectedPictureMode = pictureModes[selectedIndex]
+        picturePicker.selectItem(at: selectedIndex)
         selectedID = device.uniqueID
         listen.state = .off
         awaitingFrames = true
         refreshAudioDevice()
         lastFrameAt = Date()
         showMessage("正在连接摄像头", device.localizedName, canRetry: false)
-        camera.start(device: device) { [weak self] error in
+        camera.start(device: device, format: selectedPictureMode?.format) { [weak self] error in
             guard let self, self.generation == request else { return }
             if let error {
                 self.selectedID = nil
@@ -388,11 +458,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard devices.indices.contains(picker.indexOfSelectedItem) else { return }
         startCamera(devices[picker.indexOfSelectedItem])
     }
+    @objc private func selectPictureMode() {
+        guard !recordingBusy, !recordingPreparing, !audioChanging,
+              pictureModes.indices.contains(picturePicker.indexOfSelectedItem),
+              let device = devices.first(where: { $0.uniqueID == selectedID }) else { return }
+        selectedPictureMode = pictureModes[picturePicker.indexOfSelectedItem]
+        startCamera(device)
+    }
     @objc private func reconnect() { if !recordingBusy && !recordingPreparing { requestCamera() } }
     @objc private func toggleMirror() {
-        guard let connection = preview.previewLayer.connection, connection.isVideoMirroringSupported else { return }
-        connection.automaticallyAdjustsVideoMirroring = false
-        connection.isVideoMirrored = mirror.state == .on
+        preview.setMirrored(mirror.state == .on)
     }
     @objc private func toggleFullscreen() { window.toggleFullScreen(nil) }
     @objc private func openSettings() {
@@ -400,7 +475,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     @objc private func showAbout() {
         NSApp.orderFrontStandardAboutPanel(options: [
-            .applicationName: "WireCamera", .applicationVersion: "1.3.1",
+            .applicationName: "WireCamera", .applicationVersion: "1.4.0",
             .credits: NSAttributedString(string: "摄像头预览、声音监听与本地录制。\n音视频仅在本机处理，不上传。")
         ])
     }
@@ -430,6 +505,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func updateRecordingControls() {
         let locked = recordingBusy || recordingPreparing
         picker.isEnabled = !locked && !devices.isEmpty
+        picturePicker.isEnabled = !locked && !audioChanging && selectedID != nil && pictureModes.count > 1
         mirror.isEnabled = !locked
         retry.isEnabled = !locked
         recordAudio.isEnabled = !locked && audioDevice != nil && !audioChanging
@@ -451,7 +527,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func showRecordingError(_ message: String) {
         lastRecordingError = message
-        guard recordingTestDirectory == nil else { return }
+        guard recordingTestDirectory == nil && pictureTestDirectory == nil else { return }
         let alert = NSAlert()
         alert.messageText = "录制或声音操作未完成"
         alert.informativeText = message
@@ -584,6 +660,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 }
 
 extension AppDelegate {
+    private func runPictureModeE2E() {
+        guard let directory = pictureTestDirectory else { return }
+        let cases: [(String, Int32, Int32, String)] = [
+            ("4:3", 1280, 960, "standard.mov"),
+            ("16:9", 1280, 720, "wide.mov"),
+            ("4:3", 1280, 960, "standard-again.mov")
+        ]
+        let started = Date()
+        var caseIndex = 0
+        var phase = 0
+        var selectedAt = Date()
+        var checks: [[String: Any]] = []
+        func finish(_ error: String? = nil) {
+            let result: [String: Any] = [
+                "passed": error == nil && checks.allSatisfy { $0["passed"] as? Bool == true },
+                "error": error ?? "", "checks": checks,
+                "timestamp": ISO8601DateFormatter().string(from: Date())
+            ]
+            do {
+                try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
+                    .write(to: directory.appendingPathComponent("app-result.json"), options: .atomic)
+            } catch { NSLog("Picture mode report failed: %@", error.localizedDescription) }
+            NSApp.terminate(nil)
+        }
+        let testTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { timer in
+            if Date().timeIntervalSince(started) > 150 {
+                timer.invalidate()
+                finish("Timeout: \(self.status.stringValue), case \(caseIndex), phase \(phase)")
+                return
+            }
+            if let error = self.lastRecordingError {
+                timer.invalidate()
+                finish(error)
+                return
+            }
+            let current = cases[caseIndex]
+            switch phase {
+            case 0:
+                guard !self.awaitingFrames, self.selectedID != nil else { return }
+                guard let index = self.pictureModes.firstIndex(where: { $0.identifier == current.0 }), self.audioDevice != nil else {
+                    timer.invalidate()
+                    finish("Required native picture mode or matching camera audio unavailable")
+                    return
+                }
+                self.picturePicker.selectItem(at: index)
+                self.picturePicker.sendAction(self.picturePicker.action, to: self.picturePicker.target)
+                selectedAt = Date()
+                phase = 1
+            case 1:
+                guard !self.awaitingFrames, self.latestVideoWidth == current.1, self.latestVideoHeight == current.2, self.recordButton.isEnabled, Date().timeIntervalSince(selectedAt) > 2 else { return }
+                checks.append(["name": "preview_\(caseIndex)_\(current.0)", "passed": true, "width": self.latestVideoWidth, "height": self.latestVideoHeight])
+                let displayed = self.preview.displayedVideoRect
+                let displayMatches = self.preview.displayLayer.sampleBufferRenderer.status == .rendering && displayed.height > 0 && abs(displayed.width / displayed.height - CGFloat(current.1) / CGFloat(current.2)) < 0.01
+                checks.append(["name": "visible_preview_ratio_\(caseIndex)", "passed": displayMatches, "displayedWidth": displayed.width, "displayedHeight": displayed.height])
+                self.recordAudio.state = .on
+                self.recordingTestURL = directory.appendingPathComponent(current.3)
+                self.recordButton.performClick(nil)
+                phase = 2
+            case 2:
+                guard let recordingStarted = self.recordingStarted, Date().timeIntervalSince(recordingStarted) > 2 else { return }
+                checks.append(["name": "mode_locked_during_recording_\(caseIndex)", "passed": !self.picturePicker.isEnabled])
+                checks.append(["name": "preview_stays_selected_with_audio_\(caseIndex)", "passed": self.latestVideoWidth == current.1 && self.latestVideoHeight == current.2 && Date().timeIntervalSince(self.lastFrameAt) < 3])
+                self.recordButton.performClick(nil)
+                phase = 3
+            default:
+                guard !self.recordingBusy, self.savedRecordings == caseIndex + 1 else { return }
+                checks.append(["name": "saved_\(current.3)", "passed": self.lastRecording?.lastPathComponent == current.3])
+                caseIndex += 1
+                if caseIndex == cases.count {
+                    timer.invalidate()
+                    finish()
+                } else { phase = 0 }
+            }
+        }
+        RunLoop.main.add(testTimer, forMode: .common)
+    }
+
     private func writeRecordingTestResult(error: String?) {
         guard let directory = recordingTestDirectory else { return }
         let failure = testFailure ?? error
@@ -695,6 +848,14 @@ if CommandLine.arguments.contains("--diagnose") {
     }
     print("Discovered \(cameras.count) camera(s).")
 } else {
+    if !CommandLine.arguments.contains("--check-ui"),
+       let identifier = Bundle.main.bundleIdentifier,
+       let existing = NSRunningApplication.runningApplications(withBundleIdentifier: identifier).first(where: {
+           $0.processIdentifier != ProcessInfo.processInfo.processIdentifier && !$0.isTerminated
+       }) {
+        existing.activate(options: [.activateAllWindows])
+        exit(0)
+    }
     let app = NSApplication.shared
     let delegate = AppDelegate()
     app.delegate = delegate

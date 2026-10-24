@@ -22,7 +22,10 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
     private var stopRequested = false
     private var lastReport = 0.0
     private var count = 0
+    private var videoDevice: AVCaptureDevice?
+    private var requestedFormat: AVCaptureDevice.Format?
     var onFrame: ((Int32, Int32, Double) -> Void)?
+    var onSampleBuffer: ((CMSampleBuffer) -> Void)?
     var onRecording: ((RecordingEvent) -> Void)?
 
     private func failure(_ message: String) -> NSError {
@@ -33,7 +36,7 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
         DispatchQueue.main.async { self.onRecording?(event) }
     }
 
-    func start(device: AVCaptureDevice, completion: @escaping (String?) -> Void) {
+    func start(device: AVCaptureDevice, format: AVCaptureDevice.Format? = nil, completion: @escaping (String?) -> Void) {
         queue.async {
             guard self.destination == nil else {
                 DispatchQueue.main.async { completion("请先停止录制。") }
@@ -46,12 +49,25 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
             self.audioInput = nil
             self.audioPreview = nil
             self.monitoring = false
+            self.videoDevice = device
+            self.requestedFormat = format
             var errorMessage: String?
             do {
                 let input = try AVCaptureDeviceInput(device: device)
                 guard self.session.canAddInput(input) else { throw self.failure("无法连接此摄像头，请检查 USB 连接。") }
                 self.session.addInput(input)
-                if self.session.canSetSessionPreset(.hd1920x1080) {
+                if let format {
+                    let size = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+                    let preset: AVCaptureSession.Preset
+                    switch (size.width, size.height) {
+                    case (1280, 720): preset = .hd1280x720
+                    case (1920, 1080): preset = .hd1920x1080
+                    case (640, 480): preset = .vga640x480
+                    default: preset = .high
+                    }
+                    guard self.session.canSetSessionPreset(preset) else { throw self.failure("当前摄像头无法使用所选画面格式。") }
+                    self.session.sessionPreset = preset
+                } else if self.session.canSetSessionPreset(.hd1920x1080) {
                     self.session.sessionPreset = .hd1920x1080
                 } else if self.session.canSetSessionPreset(.high) {
                     self.session.sessionPreset = .high
@@ -71,10 +87,27 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
             if errorMessage == nil {
                 self.session.startRunning()
                 if !self.session.isRunning { errorMessage = "摄像头未能启动，请关闭占用摄像头的其他应用后重试。" }
+                else {
+                    do { try self.applyVideoFormat() }
+                    catch { errorMessage = error.localizedDescription }
+                }
             }
             let result = errorMessage
             DispatchQueue.main.async { completion(result) }
         }
+    }
+
+    private func applyVideoFormat() throws {
+        guard let device = videoDevice, let format = requestedFormat else { return }
+        try device.lockForConfiguration()
+        defer { device.unlockForConfiguration() }
+        device.activeFormat = format
+        if let range = format.videoSupportedFrameRateRanges.min(by: { abs($0.maxFrameRate - 30) < abs($1.maxFrameRate - 30) }) {
+            device.activeVideoMinFrameDuration = range.minFrameDuration
+            device.activeVideoMaxFrameDuration = range.minFrameDuration
+        }
+        let actual = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
+        NSLog("Native camera format: %d x %d", actual.width, actual.height)
     }
 
     private func configureAudio(_ device: AVCaptureDevice?) throws {
@@ -112,7 +145,7 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
             self.monitoring = device != nil
             self.volume = volume
             var message: String?
-            do { try self.configureAudio(device) }
+            do { try self.configureAudio(device); try self.applyVideoFormat() }
             catch {
                 self.monitoring = false
                 try? self.configureAudio(nil)
@@ -159,6 +192,7 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
                 guard FileManager.default.isWritableFile(atPath: parent.path) else { throw self.failure("保存位置不可写，请选择其他文件夹。") }
                 try self.configureAudio(audioDevice ?? (self.monitoring ? self.audioInput?.device : nil))
                 try self.configureRecordedAudio(enabled: audioDevice != nil)
+                try self.applyVideoFormat()
                 guard let connection = self.movie.connection(with: .video), connection.isActive else {
                     throw self.failure("摄像头没有可录制的视频连接。")
                 }
@@ -224,7 +258,7 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
             self.destination = nil
             self.stagingURL = nil
             self.stopRequested = false
-            if !self.monitoring { try? self.configureAudio(nil) }
+            if !self.monitoring { try? self.configureAudio(nil); try? self.applyVideoFormat() }
             self.publish(.finished(saved, message))
         }
     }
@@ -246,10 +280,18 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let format = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
+        onSampleBuffer?(sampleBuffer)
         let size = CMVideoFormatDescriptionGetDimensions(format)
         let now = ProcessInfo.processInfo.systemUptime
         count += 1
         if lastReport == 0 || now - lastReport >= 1 {
+            if lastReport == 0 {
+                NSLog("Capture format: %d x %d", size.width, size.height)
+                if let pixels = CMSampleBufferGetImageBuffer(sampleBuffer) {
+                    let attachments = CMCopyDictionaryOfAttachments(allocator: kCFAllocatorDefault, target: pixels, attachmentMode: kCMAttachmentMode_ShouldPropagate)
+                    NSLog("Pixel buffer: %ld x %ld; attachments: %@", CVPixelBufferGetWidth(pixels), CVPixelBufferGetHeight(pixels), String(describing: attachments))
+                }
+            }
             let fps = lastReport == 0 ? 0 : Double(count) / (now - lastReport)
             lastReport = now
             count = 0

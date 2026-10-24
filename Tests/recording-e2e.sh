@@ -2,6 +2,10 @@
 set -euo pipefail
 cd "${0:A:h:h}"
 APP_PATH="${1:-$PWD/WireCamera.app}"
+if pgrep -f '/WireCamera.app/Contents/MacOS/WireCamera' >/dev/null; then
+  printf '请先退出所有 WireCamera 实例，再运行录制测试。\n' >&2
+  exit 1
+fi
 RUN_DIR="$PWD/.build/recording-e2e/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RUN_DIR"
 command -v ffprobe >/dev/null
