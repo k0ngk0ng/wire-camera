@@ -1,0 +1,60 @@
+{
+  "status": "static_reconstruction_not_runtime_validated",
+  "vectors": [
+    {
+      "name": "empty_discovery",
+      "packetHex": "5170480401a8140c",
+      "decoded": {
+        "command": 2600,
+        "sequence": 1,
+        "rpc": 0,
+        "code": 0,
+        "encryption": 3,
+        "body": "",
+        "consumed": 8
+      }
+    },
+    {
+      "name": "filtered_discovery",
+      "packetHex": "5170482401a8140c67e7d20abaa68c96373d8191e09100437db13a956d98868266cd9c2fffd73ef1",
+      "decoded": {
+        "command": 2600,
+        "sequence": 1,
+        "rpc": 0,
+        "code": 0,
+        "encryption": 3,
+        "body": "0a0e666978747572652d646576696365120448413130",
+        "consumed": 40
+      }
+    },
+    {
+      "name": "lan_auth_fixture",
+      "packetHex": "483401da140ce5b77cdf0f64bf43bcf763d78ff210e8abd80d10c1c6dd8dcfc1b24f66251357d62ecd3d8975f8bc2400d05fc94a369e",
+      "decoded": {
+        "command": 2650,
+        "sequence": 1,
+        "rpc": 0,
+        "code": 0,
+        "encryption": 3,
+        "body": "120e666978747572652d6465766963651a0e244c666978747572652d7369676e",
+        "consumed": 54
+      }
+    },
+    {
+      "name": "sync",
+      "packetHex": "4813026a0c8d2469cda8233f33883670f99dbe54f0",
+      "decoded": {
+        "command": 106,
+        "sequence": 2,
+        "rpc": 0,
+        "code": 0,
+        "encryption": 3,
+        "body": "0801",
+        "consumed": 21
+      }
+    }
+  ],
+  "sourceArtifactSHA256": "995021530f39fcdbdc8d376106acd8bf98b1c5f8f2606ec2ee1b406dad916449",
+  "source": "Official Linklemo Android libipcuser.so; static ARM64 reconstruction, not real-device validation",
+  "binaryDiscoveryResponseHex": "5170484501a8140d00b0c26dffe3c78133df38dd182f6fa8c71f136b890f8565648fc5698722107cfe523a777d1baa9cd43ed4dcea0fc4c1b1b1e5db010e4f816258f8fdb0d871337e"
+}

@@ -1,0 +1,86 @@
+{
+  "authority": "derived-from-static-disassembly",
+  "nativeSdkExecuted": false,
+  "hardwareAccepted": false,
+  "cryptoCrossCheck": "Python cryptography AES-CBC output equals /usr/bin/openssl enc -aes-256-cbc output",
+  "sourceArtifactSHA256": "995021530f39fcdbdc8d376106acd8bf98b1c5f8f2606ec2ee1b406dad916449",
+  "sourceEvidenceID": "ev_a02ffd80ef3220f87877dbdba9d628b292062b061683c2e1bbd945a760dfd551",
+  "configuration": [
+    {
+      "name": "ascii",
+      "ssid": "WireCameraLab",
+      "password": "test-password-123",
+      "verificationCode": "",
+      "timestamp": 1700000000000,
+      "plaintextHex": "0600000080d095ffbc3101984e00030d5769726543616d6572614c616211746573742d70617373776f72642d313233000000",
+      "encodedHex": "0340638ce51b134654348d8877b9e867bb2e43b29a933bce44a84ea82640ce102e5f821ac6f8f4106f032c5111a36573742fd7a9a640e1a3c2fe4ab4384bdb765ad7",
+      "packetsHex": [
+        "0401110340638ce51b134654348d8877b9e867bb",
+        "0402112e43b29a933bce44a84ea82640ce102e5f",
+        "040311821ac6f8f4106f032c5111a36573742fd7",
+        "04040fa9a640e1a3c2fe4ab4384bdb765ad7"
+      ]
+    },
+    {
+      "name": "utf8",
+      "ssid": "模块实验室",
+      "password": "password123",
+      "verificationCode": "",
+      "timestamp": 1700000000000,
+      "plaintextHex": "0600000080d095ffbc3101984e00030fe6a8a1e59d97e5ae9ee9aa8ce5aea40b70617373776f7264313233000000",
+      "encodedHex": "0330ee70e51914d64d23e7ee9ff30e9ae0d941578cc94092ebbc62ac373e3f655905b5fee84c2a43f6d7de47f894518f66ce",
+      "packetsHex": [
+        "0301110330ee70e51914d64d23e7ee9ff30e9ae0",
+        "030211d941578cc94092ebbc62ac373e3f655905",
+        "030310b5fee84c2a43f6d7de47f894518f66ce"
+      ]
+    },
+    {
+      "name": "open",
+      "ssid": "OpenLab",
+      "password": "",
+      "verificationCode": "",
+      "timestamp": 0,
+      "plaintextHex": "060000000001984e0003074f70656e4c616200000000",
+      "encodedHex": "0320f3b9985ff4921d71ad07639971f8032a62eee0d040cf660642d47f3d366bb243",
+      "packetsHex": [
+        "0201110320f3b9985ff4921d71ad07639971f803",
+        "0202112a62eee0d040cf660642d47f3d366bb243"
+      ]
+    }
+  ],
+  "responses": [
+    {
+      "name": "success",
+      "status": 0,
+      "strings": [
+        "TEST-DEVICE-001",
+        "test-salt-123456"
+      ],
+      "plaintextHex": "040000000001984e0100020f544553542d4445564943452d30303110746573742d73616c742d3132333435360000",
+      "encodedHex": "0330fcc793eb1eca787e70ffde8a4260d1ad6678963ab83e194d5b17198f38645b70366692cc664282fdf693de86742edef2",
+      "packetsHex": [
+        "0301110330fcc793eb1eca787e70ffde8a4260d1",
+        "030211ad6678963ab83e194d5b17198f38645b70",
+        "030310366692cc664282fdf693de86742edef2"
+      ]
+    },
+    {
+      "name": "rejected",
+      "status": 1,
+      "strings": [],
+      "plaintextHex": "040000000001984e0101000000",
+      "encodedHex": "03104f9edeff3bf6af8ef0fa5b83978edb00",
+      "packetsHex": [
+        "02011103104f9edeff3bf6af8ef0fa5b83978edb",
+        "02020100"
+      ]
+    },
+    {
+      "name": "invalid_padding",
+      "plaintextHex": "040000000001984e01000211544553542d4445564943452d303031585810746573742d73616c742d3132333435360000",
+      "encodedHex": "0330f10aec4a1009647a6785d452c26ec1fcbe3a1e61f1be9f55cb1102cff2c578a51bc3a89f72f7acd772b5c91e2bd21c6f",
+      "construction": "Valid compact response encrypted without padding; plaintext ends in 00 and exactly fills AES blocks."
+    }
+  ]
+}

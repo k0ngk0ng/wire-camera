@@ -1,6 +1,5 @@
 import AppKit
 
-// Render the editable SVG into exact pixel sizes, independent of display scale.
 let output = URL(fileURLWithPath: CommandLine.arguments[1]).appendingPathComponent("AppIcon.iconset")
 let source = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("Assets/AppIcon.svg")
 guard let artwork = NSImage(contentsOf: source) else {

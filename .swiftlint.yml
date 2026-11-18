@@ -1,0 +1,34 @@
+included:
+  - Sources
+  - Tests
+  - scripts
+excluded:
+  - .build
+  - .local
+  - WireCamera.app
+only_rules:
+  - type_name
+  - identifier_name
+  - file_name
+  - custom_rules
+type_name:
+  min_length: 3
+  max_length: 64
+identifier_name:
+  min_length: 1
+  max_length: 64
+  allowed_symbols: []
+file_name:
+  excluded:
+    - main.swift
+    - make-icon.swift
+    - module-protocol-check.swift
+    - password-field-check.swift
+custom_rules:
+  source_comments:
+    name: Source comments
+    regex: '.+'
+    match_kinds:
+      - comment
+    message: 代码文件不得包含注释。
+    severity: error

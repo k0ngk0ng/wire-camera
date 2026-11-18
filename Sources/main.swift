@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import CoreMedia
+import CoreImage
 import UniformTypeIdentifiers
 
 func cameraDevices() -> [AVCaptureDevice] {
@@ -68,6 +69,14 @@ final class PreviewView: NSView {
         displayLayer.setAffineTransform(enabled ? CGAffineTransform(scaleX: -1, y: 1) : .identity)
     }
 
+    func reset() {
+        sampleLock.lock()
+        pendingSample = nil
+        sampleLock.unlock()
+        presentationSize = .zero
+        displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
+    }
+
     override func layout() {
         super.layout()
         CATransaction.begin()
@@ -88,6 +97,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var latestVideoWidth: Int32 = 0
     private var latestVideoHeight: Int32 = 0
     private var pictureTestDirectory: URL?
+    private var moduleTestDirectory: URL?
+    private var moduleConnection: CameraModuleConnection?
+    private let moduleNetwork = CameraModuleNetwork()
+    private var selectedNetworkModule: CameraModuleNetworkDevice?
+    private var knownNetworkModule: CameraModuleNetworkDevice?
+    private var moduleIdentity: CameraModuleIdentity?
+    private var modulePreviewTestDirectory: URL?
+    private var modulePreviewSample: CMSampleBuffer?
+    private var modulePreviewStarted: Date?
+    private var modulePreviewReports = 0
+    private var moduleLastError: String?
+    private let addModule = NSButton(title: "添加摄像头", target: nil, action: nil)
     private let mirror = NSButton(checkboxWithTitle: "镜像", target: nil, action: nil)
     private let recordButton = NSButton(title: "开始录制", target: nil, action: nil)
     private let recordAudio = NSButton(checkboxWithTitle: "录入声音", target: nil, action: nil)
@@ -137,6 +158,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let index = CommandLine.arguments.firstIndex(of: "--picture-mode-e2e"), CommandLine.arguments.indices.contains(index + 1) {
             pictureTestDirectory = URL(fileURLWithPath: CommandLine.arguments[index + 1])
         }
+        if let index = CommandLine.arguments.firstIndex(of: "--module-connection-e2e"), CommandLine.arguments.indices.contains(index + 1) {
+            moduleTestDirectory = URL(fileURLWithPath: CommandLine.arguments[index + 1])
+        }
+        if let index = CommandLine.arguments.firstIndex(of: "--module-preview-e2e"), CommandLine.arguments.indices.contains(index + 1) {
+            modulePreviewTestDirectory = URL(fileURLWithPath: CommandLine.arguments[index + 1])
+        }
         if let index = CommandLine.arguments.firstIndex(of: "--check-ui"),
            CommandLine.arguments.indices.contains(index + 1) {
             let root = window.contentView!
@@ -153,7 +180,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 exit(1)
             }
         }
-        camera.onSampleBuffer = { [weak self] sample in self?.preview.enqueue(sample) }
+        camera.onSampleBuffer = { [weak self] sample in
+            DispatchQueue.main.async {
+                guard let self, self.selectedNetworkModule == nil else { return }
+                self.preview.enqueue(sample)
+            }
+        }
+        moduleNetwork.onSampleBuffer = { [weak self] sample in
+            DispatchQueue.main.async {
+                guard let self, self.selectedNetworkModule != nil else { return }
+                self.preview.enqueue(sample)
+                if self.modulePreviewTestDirectory != nil { self.modulePreviewSample = sample }
+            }
+        }
+        moduleNetwork.onFrame = { [weak self] width, height, fps in self?.moduleFrame(width: width, height: height, fps: fps) }
+        moduleNetwork.onError = { [weak self] message in
+            guard let self, self.selectedNetworkModule != nil else { return }
+            self.moduleLastError = message
+            self.showMessage("模块画面连接中断", message)
+        }
         camera.onFrame = { [weak self] width, height, fps in
             guard let self, self.selectedID != nil else { return }
             if let expected = self.selectedPictureMode?.dimensions, (expected.width != width || expected.height != height) { return }
@@ -180,12 +225,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self?.showMessage("摄像头暂时不可用", error?.localizedDescription ?? "请检查连接，然后点击重试。")
         })
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            guard let self, self.selectedID != nil, Date().timeIntervalSince(self.lastFrameAt) > 8 else { return }
-            self.showMessage("暂未收到画面", "请检查 USB 连接，或关闭正在使用摄像头的其他应用，然后点击重试。")
+            guard let self, self.selectedID != nil || self.selectedNetworkModule != nil, Date().timeIntervalSince(self.lastFrameAt) > 8 else { return }
+            self.showMessage("暂未收到画面", self.selectedNetworkModule == nil ? "请检查 USB 连接，或关闭正在使用摄像头的其他应用，然后点击重试。" : "请确认模块保持供电、Wi-Fi 连接正常，然后重新连接模块。")
         }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        requestCamera()
+        if moduleTestDirectory == nil && modulePreviewTestDirectory == nil && !CommandLine.arguments.contains("--add-camera") { requestCamera() }
         recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             guard let self, let started = self.recordingStarted else { return }
             let seconds = Int(Date().timeIntervalSince(started))
@@ -193,6 +238,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         if recordingTestDirectory != nil { runRecordingE2E() }
         if pictureTestDirectory != nil { runPictureModeE2E() }
+        if let directory = moduleTestDirectory {
+            addModule.performClick(nil)
+            moduleConnection?.runE2E(to: directory)
+        } else if CommandLine.arguments.contains("--add-camera") {
+            addModule.performClick(nil)
+        }
+        if modulePreviewTestDirectory != nil { addModule.performClick(nil); runModulePreviewE2E() }
     }
 
     private func buildMenu() {
@@ -209,6 +261,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let fullscreen = viewMenu.addItem(withTitle: "切换全屏", action: #selector(toggleFullscreen), keyEquivalent: "f")
         fullscreen.keyEquivalentModifierMask = [.command, .control]
         viewMenu.addItem(withTitle: "重新连接", action: #selector(reconnect), keyEquivalent: "r")
+        viewMenu.addItem(withTitle: "添加摄像头…", action: #selector(showModuleConnection), keyEquivalent: "n")
         viewItem.submenu = viewMenu
         menu.addItem(viewItem)
         NSApp.mainMenu = menu
@@ -256,7 +309,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         mirror.action = #selector(toggleMirror)
         let fullscreen = NSButton(title: "全屏", target: self, action: #selector(toggleFullscreen))
         fullscreen.bezelStyle = .rounded
-        let controls = NSStackView(views: [picker, picturePicker, mirror, fullscreen])
+        addModule.target = self
+        addModule.action = #selector(showModuleConnection)
+        addModule.bezelStyle = .rounded
+        let controls = NSStackView(views: [picker, picturePicker, mirror, fullscreen, addModule])
         controls.spacing = 12
         for view in [brand, controls] {
             view.translatesAutoresizingMaskIntoConstraints = false
@@ -382,6 +438,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func refreshDevices(force: Bool = false) {
+        if selectedNetworkModule != nil {
+            if !force { devices = cameraDevices(); updateNetworkPicker(); updateRecordingControls(); return }
+            moduleNetwork.stop()
+            selectedNetworkModule = nil
+        }
         guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { return }
         if recordingBusy {
             let connected = cameraDevices().contains { $0.uniqueID == selectedID }
@@ -393,6 +454,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         devices = cameraDevices()
         picker.removeAllItems()
+        if let knownNetworkModule { picker.addItem(withTitle: "Wi-Fi · \(knownNetworkModule.deviceID)") }
         devices.forEach { picker.addItem(withTitle: $0.localizedName) }
         picker.isEnabled = !devices.isEmpty
         guard !devices.isEmpty else {
@@ -407,13 +469,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         let index = devices.firstIndex { $0.uniqueID == selectedID } ?? 0
-        picker.selectItem(at: index)
+        picker.selectItem(at: index + (knownNetworkModule == nil ? 0 : 1))
         if force || devices[index].uniqueID != selectedID { startCamera(devices[index]) }
         else { refreshAudioDevice() }
     }
 
     private func startCamera(_ device: AVCaptureDevice) {
         guard !recordingBusy else { return }
+        if selectedNetworkModule != nil { moduleNetwork.stop(); selectedNetworkModule = nil; preview.reset() }
+        recordButton.toolTip = nil
         generation += 1
         let request = generation
         let previousMode = selectedID == device.uniqueID ? selectedPictureMode?.identifier : nil
@@ -424,6 +488,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         selectedPictureMode = pictureModes[selectedIndex]
         picturePicker.selectItem(at: selectedIndex)
         selectedID = device.uniqueID
+        if knownNetworkModule != nil { updateNetworkPicker() }
         listen.state = .off
         awaitingFrames = true
         refreshAudioDevice()
@@ -437,7 +502,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self.showMessage("连接失败", error)
             } else {
                 self.toggleMirror()
-                // A sample may arrive before startRunning returns.
                 if !self.awaitingFrames { self.overlay.isHidden = true }
             }
         }
@@ -455,6 +519,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func selectCamera() {
+        if knownNetworkModule != nil {
+            if picker.indexOfSelectedItem == 0 {
+                if let moduleIdentity { beginModuleConnection(moduleIdentity) }
+                return
+            }
+            let index = picker.indexOfSelectedItem - 1
+            guard devices.indices.contains(index) else { return }
+            let device = devices[index]
+            moduleNetwork.stop()
+            selectedNetworkModule = nil
+            selectedID = device.uniqueID
+            updateNetworkPicker()
+            if AVCaptureDevice.authorizationStatus(for: .video) == .authorized { startCamera(device) }
+            else { requestCamera() }
+            return
+        }
         guard devices.indices.contains(picker.indexOfSelectedItem) else { return }
         startCamera(devices[picker.indexOfSelectedItem])
     }
@@ -465,9 +545,102 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         selectedPictureMode = pictureModes[picturePicker.indexOfSelectedItem]
         startCamera(device)
     }
-    @objc private func reconnect() { if !recordingBusy && !recordingPreparing { requestCamera() } }
+    @objc private func reconnect() {
+        guard !recordingBusy, !recordingPreparing else { return }
+        if selectedNetworkModule != nil, let moduleIdentity { beginModuleConnection(moduleIdentity) }
+        else { requestCamera() }
+    }
+    @objc private func showModuleConnection() {
+        guard !recordingBusy, !recordingPreparing else { return }
+        if moduleConnection == nil {
+            var knownIdentifiers: [UUID] = []
+            if let index = CommandLine.arguments.firstIndex(of: "--module-identifier"), CommandLine.arguments.indices.contains(index + 1),
+               let identifier = UUID(uuidString: CommandLine.arguments[index + 1]) { knownIdentifiers.append(identifier) }
+            moduleConnection = CameraModuleConnection(knownIdentifiers: knownIdentifiers)
+            moduleConnection?.onConfigured = { [weak self] identity in
+                self?.beginModuleConnection(identity)
+            }
+            moduleConnection?.onCancelNetwork = { [weak self] in self?.moduleNetwork.stop() }
+        }
+        let arguments = CommandLine.arguments
+        var existingDeviceID: String?
+        if let index = arguments.firstIndex(of: "--module-device-id"), arguments.indices.contains(index + 1) { existingDeviceID = arguments[index + 1] }
+        moduleConnection?.present(for: window, existingDeviceID: existingDeviceID)
+    }
     @objc private func toggleMirror() {
         preview.setMirrored(mirror.state == .on)
+    }
+
+    private func updateNetworkPicker() {
+        guard let device = knownNetworkModule else { return }
+        picker.removeAllItems()
+        picker.addItem(withTitle: "Wi-Fi · \(device.deviceID)")
+        devices.forEach { picker.addItem(withTitle: $0.localizedName) }
+        if selectedNetworkModule != nil { picker.selectItem(at: 0) }
+        else if let index = devices.firstIndex(where: { $0.uniqueID == selectedID }) { picker.selectItem(at: index + 1) }
+    }
+
+    private func beginModuleConnection(_ identity: CameraModuleIdentity) {
+        moduleIdentity = identity
+        moduleLastError = nil
+        let device = CameraModuleNetworkDevice(deviceID: identity.deviceID, address: "", port: 20190)
+        moduleConnected(device)
+        moduleNetwork.connect(identity: identity) { [weak self] result in
+            guard let self else { return }
+            self.moduleConnection?.networkConnectionFinished(result)
+            switch result {
+            case .success(let device): self.moduleConnected(device)
+            case .failure(let error):
+                self.moduleLastError = error.localizedDescription
+                self.showMessage("模块连接未完成", error.localizedDescription)
+            }
+        }
+    }
+
+    private func moduleConnected(_ device: CameraModuleNetworkDevice) {
+        camera.stop()
+        generation += 1
+        selectedNetworkModule = device
+        knownNetworkModule = device
+        selectedID = nil
+        audioDevice = nil
+        listen.state = .off
+        recordAudio.state = .off
+        selectedPictureMode = nil
+        pictureModes.removeAll()
+        picturePicker.removeAllItems()
+        picturePicker.addItem(withTitle: "原生画面比例")
+        devices = cameraDevices()
+        updateNetworkPicker()
+        awaitingFrames = true
+        lastFrameAt = Date()
+        latestVideoWidth = 0
+        latestVideoHeight = 0
+        modulePreviewStarted = nil
+        modulePreviewReports = 0
+        modulePreviewSample = nil
+        moduleLastError = nil
+        preview.reset()
+        toggleMirror()
+        recordButton.toolTip = "Wi-Fi 模块目前支持实时预览，录制暂不可用。"
+        updateRecordingControls()
+        showMessage(device.address.isEmpty ? "正在连接模块" : "正在读取模块画面", device.deviceID, canRetry: false)
+    }
+
+    private func moduleFrame(width: Int32, height: Int32, fps: Double) {
+        guard selectedNetworkModule != nil, width > 0, height > 0 else { return }
+        if awaitingFrames { moduleConnection?.finishPreview() }
+        awaitingFrames = false
+        lastFrameAt = Date()
+        latestVideoWidth = width
+        latestVideoHeight = height
+        if modulePreviewStarted == nil { modulePreviewStarted = Date() }
+        modulePreviewReports += 1
+        overlay.isHidden = true
+        status.stringValue = "●  实时画面"
+        status.textColor = NSColor(calibratedRed: 0.38, green: 0.86, blue: 0.68, alpha: 1)
+        detail.stringValue = "\(width) × \(height)" + (fps > 0 ? "  ·  \(Int(fps.rounded())) fps" : "") + "  ·  局域网预览"
+        updateRecordingControls()
     }
     @objc private func toggleFullscreen() { window.toggleFullScreen(nil) }
     @objc private func openSettings() {
@@ -475,7 +648,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     @objc private func showAbout() {
         NSApp.orderFrontStandardAboutPanel(options: [
-            .applicationName: "WireCamera", .applicationVersion: "1.4.0",
+            .applicationName: "WireCamera", .applicationVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
             .credits: NSAttributedString(string: "摄像头预览、声音监听与本地录制。\n音视频仅在本机处理，不上传。")
         ])
     }
@@ -485,6 +658,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         recordingTimer?.invalidate()
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         camera.shutdown()
+        moduleNetwork.stop()
     }
 
     private func refreshAudioDevice() {
@@ -504,10 +678,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func updateRecordingControls() {
         let locked = recordingBusy || recordingPreparing
-        picker.isEnabled = !locked && !devices.isEmpty
+        picker.isEnabled = !locked && (!devices.isEmpty || knownNetworkModule != nil)
         picturePicker.isEnabled = !locked && !audioChanging && selectedID != nil && pictureModes.count > 1
         mirror.isEnabled = !locked
         retry.isEnabled = !locked
+        addModule.isEnabled = !locked
         recordAudio.isEnabled = !locked && audioDevice != nil && !audioChanging
         listen.isEnabled = !locked && audioDevice != nil && !audioChanging
         volume.isEnabled = listen.state == .on
@@ -660,6 +835,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 }
 
 extension AppDelegate {
+    private func runModulePreviewE2E() {
+        guard let directory = modulePreviewTestDirectory else { return }
+        let started = Date()
+        var retried = false
+        var retryKeptModule = false
+        let testTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { timer in
+            let seconds = self.modulePreviewStarted.map { Date().timeIntervalSince($0) } ?? 0
+            let rendered = self.preview.displayLayer.sampleBufferRenderer.status == .rendering
+            let ready = self.selectedNetworkModule != nil && !self.awaitingFrames && self.modulePreviewReports >= 3 && seconds >= 12 && rendered
+            if ready, !retried {
+                let identifier = self.selectedNetworkModule?.deviceID
+                self.reconnect()
+                retryKeptModule = self.selectedNetworkModule?.deviceID == identifier && self.picker.indexOfSelectedItem == 0
+                retried = true
+                return
+            }
+            guard ready || self.moduleLastError != nil || Date().timeIntervalSince(started) > 140 else { return }
+            timer.invalidate()
+            var frameSaved = false
+            var failure = self.moduleLastError
+            do {
+                if let sample = self.modulePreviewSample, let pixels = CMSampleBufferGetImageBuffer(sample) {
+                    let image = CIImage(cvPixelBuffer: pixels)
+                    if let cgImage = CIContext().createCGImage(image, from: image.extent),
+                       let png = NSBitmapImageRep(cgImage: cgImage).representation(using: .png, properties: [:]) {
+                        try png.write(to: directory.appendingPathComponent("frame.png"))
+                        frameSaved = true
+                    }
+                }
+            } catch { failure = error.localizedDescription }
+            let report: [String: Any] = [
+                "passed": ready && frameSaved && failure == nil && retryKeptModule,
+                "deviceID": self.selectedNetworkModule?.deviceID ?? "",
+                "address": self.selectedNetworkModule?.address ?? "",
+                "width": self.latestVideoWidth, "height": self.latestVideoHeight,
+                "frameReports": self.modulePreviewReports, "previewSeconds": seconds,
+                "visibleRenderer": rendered, "frameSaved": frameSaved,
+                "retryKeptModule": retryKeptModule,
+                "moduleListed": self.picker.itemTitles.contains("Wi-Fi · \(self.selectedNetworkModule?.deviceID ?? "")"),
+                "error": failure ?? (ready ? "" : self.status.stringValue),
+                "timestamp": ISO8601DateFormatter().string(from: Date())
+            ]
+            do {
+                try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+                    .write(to: directory.appendingPathComponent("app-result.json"), options: .atomic)
+            } catch { NSLog("Module preview E2E report failed: %@", error.localizedDescription) }
+            self.moduleConnection?.finishPreview()
+            NSApp.terminate(nil)
+        }
+        RunLoop.main.add(testTimer, forMode: .common)
+    }
+
     private func runPictureModeE2E() {
         guard let directory = pictureTestDirectory else { return }
         let cases: [(String, Int32, Int32, String)] = [

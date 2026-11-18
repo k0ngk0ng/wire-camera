@@ -3,15 +3,37 @@
 Mac 原生摄像头预览工具。双击「应用程序」中的 **WireCamera.app**（安装路径：`/Applications/WireCamera.app`），或打开项目目录中的同名应用，首次运行在系统提示中允许摄像头访问，即可查看实时画面。
 
 - 自动优先选择外接 USB 摄像头，可在右上角切换设备。
+- 支持通过蓝牙为 HA10 摄像头模块配置 2.4 GHz Wi-Fi，并在局域网内直接预览画面。
 - 支持镜像、调整窗口大小、全屏（⌃⌘F），按原始比例显示画面。
 - 支持切换摄像头原生 4:3 / 16:9 画面模式，预览与录制使用相同尺寸。
 - 支持拔插设备自动重连；⌘R 重新连接。
 - 底部显示实际画面分辨率与帧率。
-- 支持 MOV 视频录制，可选择录入摄像头自带的声音；录制时显示计时。
+- USB 摄像头支持 MOV 视频录制，可选择录入摄像头自带的声音；录制时显示计时。
 - 支持声音监听和音量调节；监听与录入声音独立。
 - 音视频仅在本机预览或保存，不上传。仅在监听或录入声音时请求麦克风权限。
 
 如果没有画面，请检查 USB 连接、关闭其他使用摄像头的应用后点击“重试”。如果拒绝过授权，在“系统设置 → 隐私与安全性 → 摄像头”中开启“WireCamera”，然后重新打开应用。
+
+## Wi-Fi 摄像头模块
+
+已验证 HA10 模块的蓝牙配网及 640 × 480 MJPEG 实时预览，不需要安装「联了么」App。模块在此模式下通过 USB-C 供电，通过蓝牙配网，再通过 Wi-Fi 传输画面；不会作为普通 USB 摄像头出现在设备列表中。
+
+1. 为模块供电，按模块说明长按按键，进入蓝灯闪烁的配网状态。
+2. 点击右上角「添加摄像头」，允许 WireCamera 使用蓝牙。
+3. 从自动搜索结果中选择 2.4 GHz Wi-Fi，输入密码，点击「连接 Wi-Fi」。Mac 与模块所在网络需要互通。
+4. 等待模块接受配置、完成局域网连接并收到画面。收到第一帧后，配置窗口自动关闭，主界面显示 `Wi-Fi · 设备ID`。
+
+macOS 要求定位权限才能让应用读取附近的 Wi-Fi 名称。如果列表为空，在「系统设置 → 隐私与安全性 → 定位服务」中开启定位服务并允许 WireCamera，然后刷新列表。WireCamera 不请求定位坐标。局域网连接还需要在「隐私与安全性 → 本地网络」中允许 WireCamera。
+
+密码使用遮罩输入，不启用系统密码自动填充，不保存到偏好设置或日志。配网后蓝牙断开时，可直接重新连接已经配网的模块。预览中的「重试」会重连当前模块，并保留设备选项；设备菜单也可切回 USB 摄像头。
+
+Wi-Fi 模块当前支持实时预览、镜像和全屏，录制与声音监听暂不可用。WireCamera 使用局域网直连，不使用厂商账号。其他模块型号尚未进行实机验证。
+
+已知设备 ID 时，可以直接连接已经配网的模块：
+
+```sh
+open "WireCamera.app" --args --add-camera --module-device-id "设备ID"
+```
 
 ## 画面比例与镜头控制
 
@@ -70,3 +92,20 @@ zsh Tests/picture-mode-e2e.sh
 ```
 
 测试在当前 USB 摄像头上依次切换 4:3、16:9、4:3，检查实时预览及带声音录像的实际尺寸。样片、JSON 报告和解码日志保存在 `.build/picture-mode-e2e/`。场景说明见 [画面比例验收](Tests/picture-mode-scenarios.md)。
+
+## 模块验证与开发检查
+
+配网窗口验证需要模块处于蓝灯闪烁状态；预览验证需要模块已经配网：
+
+```sh
+zsh Tests/module-connection-e2e.sh
+WIRECAMERA_MODULE_DEVICE_ID="设备ID" zsh Tests/module-preview-e2e.sh
+zsh Tests/password-field-e2e.sh
+zsh Tests/module-protocol-check.sh
+zsh Tests/module-network-check.sh
+zsh Tests/module-video-check.sh
+```
+
+模块预览 E2E 验证真实视频解码与主界面显示，实际执行一次「重试」，再次持续显示 12 秒后才通过。实际画面、JSON 报告和日志位于 `.build/module-preview-e2e/`。配网、报文和网络失败场景分别见 `Tests/module-connection-scenarios.md`、`Tests/module-protocol-scenarios.md`、`Tests/module-network-scenarios.md` 和 `Tests/module-preview-scenarios.md`。
+
+Swift 命名与禁用写法由 `.swiftlint.yml` 检查，目录、文件命名和 Zsh 语法由 `scripts/lint.sh` 检查。安装 SwiftLint 后运行 `zsh scripts/lint.sh`，或通过 `WIRECAMERA_SWIFTLINT` 指定其路径。
