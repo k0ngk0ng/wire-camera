@@ -100,6 +100,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var moduleTestDirectory: URL?
     private var moduleConnection: CameraModuleConnection?
     private let moduleNetwork = CameraModuleNetwork()
+    private let moduleScanner = CameraModuleNetwork()
+    private var discoveredModuleIDs: Set<String> = []
+    private var discoveryTesting = false
     private var selectedNetworkModule: CameraModuleNetworkDevice?
     private var knownNetworkModule: CameraModuleNetworkDevice?
     private var moduleIdentity: CameraModuleIdentity?
@@ -163,6 +166,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         if let index = CommandLine.arguments.firstIndex(of: "--module-preview-e2e"), CommandLine.arguments.indices.contains(index + 1) {
             modulePreviewTestDirectory = URL(fileURLWithPath: CommandLine.arguments[index + 1])
+        }
+        if let index = CommandLine.arguments.firstIndex(of: "--module-discovery-e2e"), CommandLine.arguments.indices.contains(index + 1) {
+            modulePreviewTestDirectory = URL(fileURLWithPath: CommandLine.arguments[index + 1])
+            discoveryTesting = true
         }
         if let index = CommandLine.arguments.firstIndex(of: "--check-ui"),
            CommandLine.arguments.indices.contains(index + 1) {
@@ -230,6 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        moduleScanner.scanNearby(onDevice: { [weak self] device in self?.registerNearbyModule(device) }, completion: { _ in })
         if moduleTestDirectory == nil && modulePreviewTestDirectory == nil && !CommandLine.arguments.contains("--add-camera") { requestCamera() }
         recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             guard let self, let started = self.recordingStarted else { return }
@@ -244,7 +252,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } else if CommandLine.arguments.contains("--add-camera") {
             addModule.performClick(nil)
         }
-        if modulePreviewTestDirectory != nil { addModule.performClick(nil); runModulePreviewE2E() }
+        if modulePreviewTestDirectory != nil {
+            addModule.performClick(nil)
+            if discoveryTesting { moduleConnection?.runDiscoveryE2E() }
+            runModulePreviewE2E()
+        }
     }
 
     private func buildMenu() {
@@ -561,6 +573,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self?.beginModuleConnection(identity)
             }
             moduleConnection?.onCancelNetwork = { [weak self] in self?.moduleNetwork.stop() }
+            moduleConnection?.onNetworkFound = { [weak self] device in self?.registerNearbyModule(device) }
         }
         let arguments = CommandLine.arguments
         var existingDeviceID: String?
@@ -578,6 +591,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         devices.forEach { picker.addItem(withTitle: $0.localizedName) }
         if selectedNetworkModule != nil { picker.selectItem(at: 0) }
         else if let index = devices.firstIndex(where: { $0.uniqueID == selectedID }) { picker.selectItem(at: index + 1) }
+    }
+
+    private func registerNearbyModule(_ device: CameraModuleNetworkDevice) {
+        discoveredModuleIDs.insert(device.deviceID)
+        guard knownNetworkModule == nil || knownNetworkModule?.deviceID == device.deviceID else { return }
+        knownNetworkModule = device
+        if moduleIdentity == nil { moduleIdentity = CameraModuleIdentity(deviceID: device.deviceID, salt: "") }
+        if !recordingBusy && !recordingPreparing { updateNetworkPicker(); updateRecordingControls() }
     }
 
     private func beginModuleConnection(_ identity: CameraModuleIdentity) {
@@ -659,6 +680,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         camera.shutdown()
         moduleNetwork.stop()
+        moduleScanner.stop()
     }
 
     private func refreshAudioDevice() {
@@ -873,6 +895,7 @@ extension AppDelegate {
                 "frameReports": self.modulePreviewReports, "previewSeconds": seconds,
                 "visibleRenderer": rendered, "frameSaved": frameSaved,
                 "retryKeptModule": retryKeptModule,
+                "discoveredWithoutHistory": !CommandLine.arguments.contains("--module-device-id") && !CommandLine.arguments.contains("--module-identifier") && self.discoveredModuleIDs.contains(self.selectedNetworkModule?.deviceID ?? ""),
                 "moduleListed": self.picker.itemTitles.contains("Wi-Fi · \(self.selectedNetworkModule?.deviceID ?? "")"),
                 "error": failure ?? (ready ? "" : self.status.stringValue),
                 "timestamp": ISO8601DateFormatter().string(from: Date())

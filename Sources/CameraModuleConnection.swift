@@ -17,6 +17,12 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
     private let location = CLLocationManager()
     private var locationRequested = false
     private var modules: [CBPeripheral] = []
+    private var moduleNames: [UUID: String] = [:]
+    private var networkModules: [CameraModuleNetworkDevice] = []
+    private var selectedNetworkCandidate: CameraModuleNetworkDevice?
+    private let networkScanner = CameraModuleNetwork()
+    private var networkScanning = false
+    private var bluetoothIssue: String?
     private var selected: CBPeripheral?
     private var writeCharacteristic: CBCharacteristic?
     private var subscriptions: Set<String> = []
@@ -34,9 +40,11 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
     private var writes = 0
     private var testTimer: Timer?
     private var testOpenedFromMainWindow = false
+    private var presented = false
     private let knownIdentifiers: [UUID]
     var onConfigured: ((CameraModuleIdentity) -> Void)?
     var onCancelNetwork: (() -> Void)?
+    var onNetworkFound: ((CameraModuleNetworkDevice) -> Void)?
 
     init(knownIdentifiers: [UUID] = []) {
         self.knownIdentifiers = knownIdentifiers
@@ -46,6 +54,7 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
     }
 
     func present(for parent: NSWindow, existingDeviceID: String? = nil) {
+        presented = true
         if panel.sheetParent == nil { parent.beginSheet(panel) }
         panel.makeKeyAndOrderFront(nil)
         if let existingDeviceID {
@@ -56,7 +65,8 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
         }
         if manager == nil {
             manager = CBCentralManager(delegate: self, queue: .main, options: [CBCentralManagerOptionShowPowerAlertKey: false])
-        } else { startScan() }
+        }
+        startScan()
         refreshWiFi()
     }
 
@@ -68,7 +78,7 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
         guard let root = panel.contentView else { return }
         let title = NSTextField(labelWithString: "连接摄像头模块")
         title.font = .systemFont(ofSize: 20, weight: .semibold)
-        let moduleLabel = NSTextField(labelWithString: "蓝牙模块")
+        let moduleLabel = NSTextField(labelWithString: "摄像头")
         let wifiLabel = NSTextField(labelWithString: "Wi-Fi")
         let passwordLabel = NSTextField(labelWithString: "密码")
         for label in [moduleLabel, wifiLabel, passwordLabel] {
@@ -79,7 +89,7 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
         modulePicker.isEnabled = false
         modulePicker.target = self
         modulePicker.action = #selector(selectModule)
-        modulePicker.setAccessibilityLabel("摄像头蓝牙模块")
+        modulePicker.setAccessibilityLabel("摄像头模块")
         scanButton.target = self
         scanButton.action = #selector(scanAgain)
         wifiName.isEditable = true
@@ -151,13 +161,13 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
     }
 
     private func updateControls() {
-        modulePicker.isEnabled = !busy && !modules.isEmpty
+        modulePicker.isEnabled = !busy && (!modules.isEmpty || !networkModules.isEmpty)
         scanButton.isEnabled = !busy
-        wifiName.isEnabled = !busy && configuredIdentity == nil
-        password.isEnabled = !busy && configuredIdentity == nil
-        wifiRefresh.isEnabled = !busy && configuredIdentity == nil
-        connectButton.isEnabled = !busy && !configured && (configuredIdentity != nil || (ready && CameraModuleProtocol.validateCredentials(ssid: wifiName.stringValue, password: password.stringValue) == nil))
-        connectButton.title = configured ? "Wi-Fi 已连接" : (busy ? "正在连接…" : (configuredIdentity != nil ? "重新连接模块" : "连接 Wi-Fi"))
+        wifiName.isEnabled = !busy && configuredIdentity == nil && selectedNetworkCandidate == nil
+        password.isEnabled = !busy && configuredIdentity == nil && selectedNetworkCandidate == nil
+        wifiRefresh.isEnabled = !busy && configuredIdentity == nil && selectedNetworkCandidate == nil
+        connectButton.isEnabled = !busy && !configured && (selectedNetworkCandidate != nil || configuredIdentity != nil || (ready && CameraModuleProtocol.validateCredentials(ssid: wifiName.stringValue, password: password.stringValue) == nil))
+        connectButton.title = configured ? "Wi-Fi 已连接" : (busy ? "正在连接…" : (configuredIdentity != nil ? "重新连接模块" : (selectedNetworkCandidate != nil ? "打开画面" : "连接 Wi-Fi")))
     }
 
     @objc private func refreshWiFi() {
@@ -196,76 +206,172 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        guard presented else { return }
+        NSLog("Module Bluetooth state=%ld authorization=%ld", central.state.rawValue, CBManager.authorization.rawValue)
         switch central.state {
-        case .poweredOn: startScan()
-        case .unauthorized: fail("需要蓝牙权限。请在系统设置的「隐私与安全性 → 蓝牙」中允许 WireCamera。")
-        case .poweredOff: fail("蓝牙已关闭，请打开 Mac 的蓝牙后重新扫描。")
-        case .unsupported: fail("这台 Mac 不支持所需的蓝牙连接。")
-        default: status.stringValue = "正在准备蓝牙…"
+        case .poweredOn: beginBluetoothScan()
+        case .unauthorized: bluetoothUnavailable("需要蓝牙权限。请在「隐私与安全性 → 蓝牙」中允许 WireCamera；已联网模块仍可通过局域网找到。")
+        case .poweredOff: bluetoothUnavailable("蓝牙已关闭；正在搜索已联网的模块。")
+        case .unsupported: bluetoothUnavailable("这台 Mac 不支持蓝牙配网；仍可连接已联网的模块。")
+        default:
+            if modules.isEmpty && networkModules.isEmpty { status.stringValue = bluetoothPreparationMessage() }
         }
     }
 
     @objc private func scanAgain() { startScan() }
 
     private func startScan() {
-        guard !busy, let manager, manager.state == .poweredOn else { return }
+        guard !busy else { return }
+        if manager == nil { manager = CBCentralManager(delegate: self, queue: .main, options: [CBCentralManagerOptionShowPowerAlertKey: false]) }
+        guard let manager else { return }
         request += 1
         scanRequest += 1
-        let currentScan = scanRequest
         manager.stopScan()
-        if let selected { manager.cancelPeripheralConnection(selected) }
-        selected = nil
+        let preserved = ready && selected?.state == .connected ? selected : nil
+        let previous = selected
+        selected = preserved
+        if preserved == nil, let previous { manager.cancelPeripheralConnection(previous) }
         configured = false
         configuredIdentity = nil
-        ready = false
-        writeCharacteristic = nil
-        subscriptions.removeAll()
-        modules.removeAll()
+        selectedNetworkCandidate = nil
+        ready = preserved != nil
+        if preserved == nil { writeCharacteristic = nil; subscriptions.removeAll() }
+        modules = preserved.map { [$0] } ?? []
+        networkModules.removeAll()
+        bluetoothIssue = nil
         modulePicker.removeAllItems()
         modulePicker.addItem(withTitle: "正在扫描…")
-        scanning = true
-        status.stringValue = "正在查找模块，请保持模块处于蓝灯闪烁状态。"
+        scanning = false
+        networkScanning = true
+        status.stringValue = manager.state == .poweredOn ? "正在搜索蓝牙和局域网模块…" : bluetoothPreparationMessage()
+        if preserved != nil { rebuildModulePicker() }
         updateControls()
-        manager.scanForPeripherals(withServices: nil)
+        let currentScan = scanRequest
+        networkScanner.scanNearby(onDevice: { [weak self] device in
+            guard let self, currentScan == self.scanRequest, self.presented else { return }
+            if let index = self.networkModules.firstIndex(where: { $0.deviceID == device.deviceID }) { self.networkModules[index] = device }
+            else { self.networkModules.append(device) }
+            self.onNetworkFound?(device)
+            self.rebuildModulePicker()
+        }, completion: { [weak self] error in
+            guard let self, currentScan == self.scanRequest else { return }
+            self.networkScanning = false
+            if let error, self.modules.isEmpty && self.networkModules.isEmpty { self.status.stringValue = error }
+            else { self.finishScanningIfEmpty() }
+        })
+        switch manager.state {
+        case .poweredOn: beginBluetoothScan()
+        case .unauthorized: bluetoothUnavailable("需要蓝牙权限。请在「隐私与安全性 → 蓝牙」中允许 WireCamera；已联网模块仍可通过局域网找到。")
+        case .poweredOff: bluetoothUnavailable("蓝牙已关闭；正在搜索已联网的模块。")
+        default: break
+        }
+    }
+
+    private func beginBluetoothScan() {
+        guard !busy, presented, let manager, manager.state == .poweredOn else { return }
+        bluetoothIssue = nil
+        scanning = true
+        let currentScan = scanRequest
+        manager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
         for peripheral in manager.retrievePeripherals(withIdentifiers: knownIdentifiers) {
-            if let name = peripheral.name, name.hasPrefix("LLM_") || name.hasPrefix("AXH_") { registerModule(peripheral, name: name) }
+            if let name = CameraModuleDiscovery.bluetoothName(advertised: nil, cached: peripheral.name) { registerModule(peripheral, name: name) }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) {
             guard currentScan == self.scanRequest, self.scanning else { return }
             self.manager?.stopScan()
             self.scanning = false
-            if self.modules.isEmpty {
-                self.modulePicker.removeAllItems()
-                self.modulePicker.addItem(withTitle: "未发现摄像头模块")
-                self.status.stringValue = "未发现模块，请确认已供电并处于蓝灯闪烁状态，然后重新扫描。"
-            }
+            self.finishScanningIfEmpty()
             self.updateControls()
         }
     }
 
+    private func bluetoothUnavailable(_ message: String) {
+        scanning = false
+        ready = false
+        bluetoothIssue = message
+        if modules.isEmpty && networkModules.isEmpty { status.stringValue = message }
+        updateControls()
+    }
+
+    private func finishScanningIfEmpty() {
+        guard !scanning, !networkScanning, modules.isEmpty, networkModules.isEmpty else { return }
+        modulePicker.removeAllItems()
+        if CBManager.authorization == .notDetermined, manager?.state != .poweredOff {
+            modulePicker.addItem(withTitle: "等待蓝牙授权")
+            status.stringValue = bluetoothPreparationMessage()
+        } else {
+            modulePicker.addItem(withTitle: "未发现摄像头模块")
+            status.stringValue = bluetoothIssue ?? "未发现模块。已联网模块需与 Mac 网络互通；蓝牙配网时请保持蓝灯闪烁，然后重新扫描。"
+        }
+        updateControls()
+    }
+
+    private func bluetoothPreparationMessage() -> String {
+        CBManager.authorization == .notDetermined ? "请在系统提示中允许 WireCamera 使用蓝牙；同时正在搜索已联网模块。" : "正在准备蓝牙并搜索局域网模块…"
+    }
+
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi: NSNumber) {
-        guard scanning, let name = peripheral.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String),
-              name.hasPrefix("LLM_") || name.hasPrefix("AXH_"),
-              !modules.contains(where: { $0.identifier == peripheral.identifier }) else { return }
+        guard scanning, let name = CameraModuleDiscovery.bluetoothName(advertised: advertisementData[CBAdvertisementDataLocalNameKey] as? String, cached: peripheral.name) else { return }
         registerModule(peripheral, name: name)
     }
 
     private func registerModule(_ peripheral: CBPeripheral, name: String) {
-        guard !modules.contains(where: { $0.identifier == peripheral.identifier }) else { return }
-        modules.append(peripheral)
-        if modules.count == 1 { modulePicker.removeAllItems() }
-        modulePicker.addItem(withTitle: name)
+        if !modules.contains(where: { $0.identifier == peripheral.identifier }) {
+            modules.append(peripheral)
+            NSLog("Camera module Bluetooth discovered: %@", name)
+        } else if moduleNames[peripheral.identifier] == name { return }
+        moduleNames[peripheral.identifier] = name
+        rebuildModulePicker()
+    }
+
+    private func rebuildModulePicker() {
+        let previous = modulePicker.selectedItem?.representedObject as? String
+        modulePicker.removeAllItems()
+        for peripheral in modules {
+            modulePicker.addItem(withTitle: "蓝牙 · \(moduleNames[peripheral.identifier] ?? peripheral.name ?? "摄像头模块")")
+            modulePicker.lastItem?.representedObject = "bluetooth:\(peripheral.identifier.uuidString)"
+        }
+        for device in networkModules {
+            modulePicker.addItem(withTitle: "Wi-Fi · \(device.deviceID)")
+            modulePicker.lastItem?.representedObject = "network:\(device.deviceID)"
+        }
+        if let index = modulePicker.itemArray.firstIndex(where: { $0.representedObject as? String == previous }), previous != nil {
+            modulePicker.selectItem(at: index)
+        } else if modulePicker.numberOfItems > 0 {
+            modulePicker.selectItem(at: 0)
+            selectModule()
+        }
         updateControls()
-        if selected == nil { modulePicker.selectItem(at: 0); selectModule() }
     }
 
     @objc private func selectModule() {
-        guard !busy, modules.indices.contains(modulePicker.indexOfSelectedItem), let manager else { return }
+        guard !busy, let key = modulePicker.selectedItem?.representedObject as? String else { return }
+        if let device = networkModules.first(where: { "network:\($0.deviceID)" == key }) {
+            request += 1
+            let previous = selected
+            selected = nil
+            if let previous { manager?.cancelPeripheralConnection(previous) }
+            selectedNetworkCandidate = device
+            configured = false
+            configuredIdentity = nil
+            ready = false
+            password.stringValue = ""
+            status.stringValue = "已发现联网模块，可直接打开画面，无需再次配网。"
+            updateControls()
+            return
+        }
+        guard let device = modules.first(where: { "bluetooth:\($0.identifier.uuidString)" == key }), let manager else { return }
+        guard manager.state == .poweredOn else { bluetoothUnavailable("蓝牙暂不可用，请检查蓝牙权限或开关。已联网模块可直接从 Wi-Fi 选项连接。"); return }
+        if selected?.identifier == device.identifier, selected?.state != .disconnected { return }
         request += 1
         let current = request
-        if selected?.identifier == modules[modulePicker.indexOfSelectedItem].identifier, selected?.state == .connected { return }
-        if let selected { manager.cancelPeripheralConnection(selected) }
-        selected = modules[modulePicker.indexOfSelectedItem]
+        let previous = selected
+        selected = nil
+        if let previous { manager.cancelPeripheralConnection(previous) }
+        selected = device
+        selectedNetworkCandidate = nil
+        configuredIdentity = nil
+        configured = false
         ready = false
         writeCharacteristic = nil
         subscriptions.removeAll()
@@ -291,6 +397,7 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         guard peripheral.identifier == selected?.identifier else { return }
+        guard peripheral.state == .disconnected else { return }
         if networkConnecting || configuredIdentity != nil { ready = false; updateControls(); return }
         fail(busy ? "模块连接已断开，请检查指示灯后重试。" : "蓝牙连接已断开，请重新扫描。")
     }
@@ -335,6 +442,7 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
 
     @objc private func connectWiFi() {
         guard !busy else { return }
+        if let device = selectedNetworkCandidate { beginNetworkConnection(CameraModuleIdentity(deviceID: device.deviceID, salt: "")); return }
         if let configuredIdentity { beginNetworkConnection(configuredIdentity); return }
         guard ready, selected != nil else { return }
         if let message = CameraModuleProtocol.validateCredentials(ssid: wifiName.stringValue, password: password.stringValue) {
@@ -391,6 +499,8 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
     private func beginNetworkConnection(_ identity: CameraModuleIdentity) {
         configuredIdentity = identity
         manager?.stopScan()
+        networkScanner.stop()
+        networkScanning = false
         scanning = false
         networkConnecting = true
         busy = true
@@ -423,16 +533,21 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
         networkConnecting = false
         pendingPackets.removeAll()
         manager?.stopScan()
+        networkScanner.stop()
+        networkScanning = false
         scanning = false
         status.stringValue = message
         updateControls()
     }
 
     @objc private func closePanel() {
+        presented = false
         request += 1
         scanRequest += 1
         wifiRequest += 1
         manager?.stopScan()
+        networkScanner.stop()
+        networkScanning = false
         scanning = false
         ready = false
         busy = false
@@ -453,6 +568,11 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
         testOpenedFromMainWindow = panel.sheetParent != nil && panel.isVisible
         let started = Date()
         testTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { timer in
+            if self.selectedNetworkCandidate != nil, let first = self.modules.first,
+               let index = self.modulePicker.itemArray.firstIndex(where: { $0.representedObject as? String == "bluetooth:\(first.identifier.uuidString)" }) {
+                self.modulePicker.selectItem(at: index)
+                self.selectModule()
+            }
             guard (self.ready && self.wifiName.numberOfItems > 0) || Date().timeIntervalSince(started) > 110 else { return }
             timer.invalidate()
             self.wifiName.stringValue = ""
@@ -474,7 +594,7 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
                 ["name": "credentials_validated", "passed": valid],
                 ["name": "no_configuration_sent", "passed": self.writes == 0]
             ]
-            let report: [String: Any] = ["passed": checks.allSatisfy { $0["passed"] as? Bool == true }, "checks": checks, "moduleName": self.selected?.name ?? "", "moduleIdentifier": self.selected?.identifier.uuidString ?? "", "status": self.status.stringValue, "timestamp": ISO8601DateFormatter().string(from: Date())]
+            let report: [String: Any] = ["passed": checks.allSatisfy { $0["passed"] as? Bool == true }, "checks": checks, "moduleName": self.selected.flatMap { self.moduleNames[$0.identifier] ?? $0.name } ?? "", "moduleIdentifier": self.selected?.identifier.uuidString ?? "", "status": self.status.stringValue, "timestamp": ISO8601DateFormatter().string(from: Date())]
             do {
                 if let root = self.panel.contentView {
                     root.layoutSubtreeIfNeeded()
@@ -487,6 +607,18 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
             } catch { NSLog("Module E2E report failed: %@", error.localizedDescription) }
             self.closePanel()
             NSApp.terminate(nil)
+        }
+    }
+
+    func runDiscoveryE2E() {
+        testTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { timer in
+            guard let device = self.networkModules.first,
+                  let index = self.modulePicker.itemArray.firstIndex(where: { $0.representedObject as? String == "network:\(device.deviceID)" }) else { return }
+            self.modulePicker.selectItem(at: index)
+            self.modulePicker.sendAction(self.modulePicker.action, to: self.modulePicker.target)
+            guard self.connectButton.isEnabled else { return }
+            timer.invalidate()
+            self.connectButton.performClick(nil)
         }
     }
 }

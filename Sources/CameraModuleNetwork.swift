@@ -67,24 +67,28 @@ enum CameraModuleNetworkProtocol {
     static let maximumFrameSize = 8 * 1024 * 1024
     private static let defaultSeed = Data("A2r0i1m1a2M0a1x6toriQue".utf8)
 
-    static func discovery(deviceID: String) throws -> Data {
-        guard validIdentifier(deviceID) else { throw moduleNetworkFailure("摄像头模块的设备标识不正确。") }
-        return try JSONSerialization.data(withJSONObject: ["cmd": "Discovery", "did": deviceID], options: [.sortedKeys])
+    static func discovery(deviceID: String? = nil) throws -> Data {
+        var fields = ["cmd": "Discovery"]
+        if let deviceID {
+            guard validIdentifier(deviceID) else { throw moduleNetworkFailure("摄像头模块的设备标识不正确。") }
+            fields["did"] = deviceID
+        }
+        return try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys])
     }
 
-    static func binaryDiscovery(deviceID: String) throws -> Data {
-        guard validIdentifier(deviceID) else { throw moduleNetworkFailure("摄像头模块的设备标识不正确。") }
-        return try encode(command: 2600, sequence: 1, body: stringField(1, deviceID), udp: true)
+    static func binaryDiscovery(deviceID: String? = nil) throws -> Data {
+        if let deviceID, !validIdentifier(deviceID) { throw moduleNetworkFailure("摄像头模块的设备标识不正确。") }
+        return try encode(command: 2600, sequence: 1, body: deviceID.map { stringField(1, $0) } ?? Data(), udp: true)
     }
 
-    static func discoveryResponse(_ data: Data, address: String, sourcePort: Int, expectedID: String) throws -> CameraModuleNetworkTarget {
+    static func discoveryResponse(_ data: Data, address: String, sourcePort: Int, expectedID: String? = nil) throws -> CameraModuleNetworkTarget {
         guard data.count > 0, data.count <= 4096, (1...65535).contains(sourcePort), let source = ipv4(address), unicast(source) else {
             throw moduleNetworkFailure("发现响应的来源不正确。")
         }
         if data.starts(with: [0x51, 0x70]) {
             let response = try decode(data)
             guard response.command == 2600, response.rpc == 1, response.status == 0,
-                  let identifier = try protobufString(response.body, field: 1), validIdentifier(identifier), identifier == expectedID,
+                  let identifier = try protobufString(response.body, field: 1), validIdentifier(identifier), expectedID == nil || identifier == expectedID,
                   try protobufInteger(response.body, field: 4) == 20190,
                   let signature = try protobufString(response.body, field: 8), signature.hasPrefix("$L"), (3...512).contains(signature.utf8.count),
                   !signature.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
@@ -95,7 +99,7 @@ enum CameraModuleNetworkProtocol {
         guard let document = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let result = document["result"] as? NSNumber, CFGetTypeID(result) != CFBooleanGetTypeID(), result.doubleValue == 0,
               let body = document["body"] as? [String: Any],
-              let identifier = body["did"] as? String, validIdentifier(identifier), identifier == expectedID,
+              let identifier = body["did"] as? String, validIdentifier(identifier), expectedID == nil || identifier == expectedID,
               let port = body["lis_port"] as? NSNumber, CFGetTypeID(port) != CFBooleanGetTypeID(), port.intValue == 20190, port.doubleValue == 20190,
               let signature = body["lsign"] as? String, signature.hasPrefix("$L"), (3...512).contains(signature.utf8.count),
               !signature.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
@@ -261,6 +265,28 @@ final class CameraModuleNetwork {
     private var sockets: Set<Int32> = []
     private var sessionKey = Data()
 
+    func scanNearby(timeout: TimeInterval = 8, onDevice: @escaping (CameraModuleNetworkDevice) -> Void, completion: @escaping (String?) -> Void) {
+        stop()
+        lock.lock()
+        let request = generation
+        lock.unlock()
+        queue.async {
+            var failure: String?
+            do {
+                try self.scan(expectedID: nil, timeout: timeout, request: request) { target in
+                    DispatchQueue.main.async {
+                        if self.current(request) { onDevice(target.device) }
+                    }
+                    return true
+                }
+            } catch { failure = error.localizedDescription }
+            let message = failure
+            DispatchQueue.main.async {
+                if self.current(request) { completion(message) }
+            }
+        }
+    }
+
     func connect(identity: CameraModuleIdentity, completion: @escaping (Result<CameraModuleNetworkDevice, Error>) -> Void) {
         stop()
         lock.lock()
@@ -344,6 +370,13 @@ final class CameraModuleNetwork {
         lock.unlock()
         var enabled: Int32 = 1
         setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled, socklen_t(MemoryLayout<Int32>.size))
+        if type == SOCK_DGRAM {
+            let flags = fcntl(descriptor, F_GETFL, 0)
+            guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
+                closeSocket(descriptor)
+                throw moduleNetworkFailure("无法启动模块的局域网扫描。")
+            }
+        }
         return descriptor
     }
 
@@ -385,8 +418,18 @@ final class CameraModuleNetwork {
     }
 
     private func discover(identity: CameraModuleIdentity, request: Int) throws -> CameraModuleNetworkTarget {
-        let packet = try CameraModuleNetworkProtocol.discovery(deviceID: identity.deviceID)
-        let binaryPacket = try CameraModuleNetworkProtocol.binaryDiscovery(deviceID: identity.deviceID)
+        var result: CameraModuleNetworkTarget?
+        try scan(expectedID: identity.deviceID, timeout: 45, request: request) { target in
+            result = target
+            return false
+        }
+        guard let result else { throw moduleNetworkFailure(current(request) ? "摄像头模块尚未出现在当前局域网。请确认模块已连上与 Mac 相通的 2.4 GHz Wi-Fi。" : "模块连接已取消。") }
+        return result
+    }
+
+    private func scan(expectedID: String?, timeout: TimeInterval, request: Int, receive: (CameraModuleNetworkTarget) -> Bool) throws {
+        let packet = try CameraModuleNetworkProtocol.discovery(deviceID: expectedID)
+        let binaryPacket = try CameraModuleNetworkProtocol.binaryDiscovery(deviceID: expectedID)
         let networks = interfaces()
         guard !networks.isEmpty else { throw moduleNetworkFailure("没有可用于发现摄像头模块的局域网连接。") }
         let descriptor = try openSocket(SOCK_DGRAM, request: request)
@@ -395,9 +438,10 @@ final class CameraModuleNetwork {
         guard setsockopt(descriptor, SOL_SOCKET, SO_BROADCAST, &enabled, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
             throw moduleNetworkFailure("无法启用摄像头模块的局域网发现。")
         }
-        let deadline = Date().addingTimeInterval(45)
+        let deadline = Date().addingTimeInterval(max(1, min(timeout, 45)))
         var nextSend = Date.distantPast
         var targetResponseError: Error?
+        var discovered: Set<String> = []
         while current(request), Date() < deadline {
             if Date() >= nextSend {
                 for network in networks {
@@ -429,10 +473,11 @@ final class CameraModuleNetwork {
             guard inet_ntop(AF_INET, &source.sin_addr, &text, socklen_t(text.count)) != nil else { continue }
             let response = Data(bytes.prefix(count))
             do {
-                return try CameraModuleNetworkProtocol.discoveryResponse(response, address: String(cString: text), sourcePort: Int(UInt16(bigEndian: source.sin_port)), expectedID: identity.deviceID)
+                let target = try CameraModuleNetworkProtocol.discoveryResponse(response, address: String(cString: text), sourcePort: Int(UInt16(bigEndian: source.sin_port)), expectedID: expectedID)
+                if discovered.insert(target.device.deviceID).inserted, !receive(target) { return }
             } catch {
                 if let document = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
-                   let body = document["body"] as? [String: Any], body["did"] as? String == identity.deviceID {
+                   let body = document["body"] as? [String: Any], let expectedID, body["did"] as? String == expectedID {
                     targetResponseError = error
                 }
             }
@@ -440,7 +485,6 @@ final class CameraModuleNetwork {
         if current(request), let targetResponseError {
             throw moduleNetworkFailure("已发现目标模块，但无法验证其连接信息：\(targetResponseError.localizedDescription)")
         }
-        throw moduleNetworkFailure(current(request) ? "摄像头模块尚未出现在当前局域网。请确认模块已连上与 Mac 相通的 2.4 GHz Wi-Fi。" : "模块连接已取消。")
     }
 
     private func connectedSocket(_ target: CameraModuleNetworkDevice, request: Int) throws -> Int32 {

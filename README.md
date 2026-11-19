@@ -3,7 +3,7 @@
 Mac 原生摄像头预览工具。双击「应用程序」中的 **WireCamera.app**（安装路径：`/Applications/WireCamera.app`），或打开项目目录中的同名应用，首次运行在系统提示中允许摄像头访问，即可查看实时画面。
 
 - 自动优先选择外接 USB 摄像头，可在右上角切换设备。
-- 支持通过蓝牙为 HA10 摄像头模块配置 2.4 GHz Wi-Fi，并在局域网内直接预览画面。
+- 支持通过蓝牙为 HA10 摄像头模块配置 2.4 GHz Wi-Fi，自动发现已联网模块并在局域网内预览画面。
 - 支持镜像、调整窗口大小、全屏（⌃⌘F），按原始比例显示画面。
 - 支持切换摄像头原生 4:3 / 16:9 画面模式，预览与录制使用相同尺寸。
 - 支持拔插设备自动重连；⌘R 重新连接。
@@ -18,9 +18,15 @@ Mac 原生摄像头预览工具。双击「应用程序」中的 **WireCamera.ap
 
 已验证 HA10 模块的蓝牙配网及 640 × 480 MJPEG 实时预览，不需要安装「联了么」App。模块在此模式下通过 USB-C 供电，通过蓝牙配网，再通过 Wi-Fi 传输画面；不会作为普通 USB 摄像头出现在设备列表中。
 
+已经配过 Wi-Fi 的模块不需要再次进入蓝牙配网状态。启动 WireCamera 后，可在右上角选择自动发现的 `Wi-Fi · 设备ID`；也可点击「添加摄像头」，选择 Wi-Fi 模块后点击「打开画面」。Mac 与模块所在网络需要互通。
+
+程序通过局域网广播发现模块，按设备 ID 识别设备，并使用回复数据包的来源 IP 连接。IP 地址变化后会在下次发现时更新，不需要固定 IP、手动输入地址或保留上次的连接记录。
+
+首次配网：
+
 1. 为模块供电，按模块说明长按按键，进入蓝灯闪烁的配网状态。
 2. 点击右上角「添加摄像头」，允许 WireCamera 使用蓝牙。
-3. 从自动搜索结果中选择 2.4 GHz Wi-Fi，输入密码，点击「连接 Wi-Fi」。Mac 与模块所在网络需要互通。
+3. 选择 `蓝牙 · 模块名称`，从自动搜索结果中选择 2.4 GHz Wi-Fi，输入密码，点击「连接 Wi-Fi」。Mac 与模块所在网络需要互通。
 4. 等待模块接受配置、完成局域网连接并收到画面。收到第一帧后，配置窗口自动关闭，主界面显示 `Wi-Fi · 设备ID`。
 
 macOS 要求定位权限才能让应用读取附近的 Wi-Fi 名称。如果列表为空，在「系统设置 → 隐私与安全性 → 定位服务」中开启定位服务并允许 WireCamera，然后刷新列表。WireCamera 不请求定位坐标。局域网连接还需要在「隐私与安全性 → 本地网络」中允许 WireCamera。
@@ -99,7 +105,9 @@ zsh Tests/picture-mode-e2e.sh
 
 ```sh
 zsh Tests/module-connection-e2e.sh
+WIRECAMERA_MODULE_DEVICE_ID="设备ID" zsh Tests/module-discovery-e2e.sh
 WIRECAMERA_MODULE_DEVICE_ID="设备ID" zsh Tests/module-preview-e2e.sh
+zsh Tests/module-scan-e2e.sh
 zsh Tests/password-field-e2e.sh
 zsh Tests/module-protocol-check.sh
 zsh Tests/module-network-check.sh
@@ -107,5 +115,7 @@ zsh Tests/module-video-check.sh
 ```
 
 模块预览 E2E 验证真实视频解码与主界面显示，实际执行一次「重试」，再次持续显示 12 秒后才通过。实际画面、JSON 报告和日志位于 `.build/module-preview-e2e/`。配网、报文和网络失败场景分别见 `Tests/module-connection-scenarios.md`、`Tests/module-protocol-scenarios.md`、`Tests/module-network-scenarios.md` 和 `Tests/module-preview-scenarios.md`。
+
+无记录发现 E2E 不向应用传入 IP、设备 ID 或蓝牙标识，通过实际连接窗口发现局域网模块、打开画面并执行重试。环境变量中的设备 ID 仅用于核对结果；可将应用路径作为第一个参数，以验证已安装版本。画面、JSON 报告和日志位于 `.build/module-discovery-e2e/`。扫描 E2E 使用真实网络套接字验证超时和取消后的回调行为，报告位于 `.build/module-scan-e2e/`；此项不要求发现真实模块。
 
 Swift 命名与禁用写法由 `.swiftlint.yml` 检查，目录、文件命名和 Zsh 语法由 `scripts/lint.sh` 检查。安装 SwiftLint 后运行 `zsh scripts/lint.sh`，或通过 `WIRECAMERA_SWIFTLINT` 指定其路径。
