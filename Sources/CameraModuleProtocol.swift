@@ -4,6 +4,13 @@ import Foundation
 struct CameraModuleIdentity {
     let deviceID: String
     let salt: String
+    let address: String?
+
+    init(deviceID: String, salt: String, address: String? = nil) {
+        self.deviceID = deviceID
+        self.salt = salt
+        self.address = address
+    }
 }
 
 private func moduleProtocolFailure(_ message: String) -> NSError {

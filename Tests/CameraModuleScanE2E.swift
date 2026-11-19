@@ -17,14 +17,30 @@ struct CameraModuleScanE2E {
             _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
         }
         let elapsed = Date().timeIntervalSince(started)
+        var manualFinished = false
+        var manualFailed = false
+        let manualStarted = Date()
+        scanner.find(address: "192.0.2.1", timeout: 1) { result in
+            if case .failure = result { manualFailed = true }
+            manualFinished = true
+        }
+        while !manualFinished && Date().timeIntervalSince(manualStarted) < 5 {
+            _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+        let manualElapsed = Date().timeIntervalSince(manualStarted)
         var staleCallbacks = 0
         scanner.scanNearby(timeout: 8, onDevice: { _ in staleCallbacks += 1 }, completion: { _ in staleCallbacks += 1 })
         scanner.stop()
         let cancellationEnd = Date().addingTimeInterval(1)
         while Date() < cancellationEnd { _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05)) }
+        scanner.find(address: "192.0.2.1", timeout: 1) { _ in staleCallbacks += 1 }
+        scanner.stop()
+        let manualCancellationEnd = Date().addingTimeInterval(1.5)
+        while Date() < manualCancellationEnd { _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05)) }
         let checks: [[String: Any]] = [
             ["name": "live_socket_scan_completed", "passed": finished && scanError == nil],
             ["name": "scan_timeout_bounded", "passed": elapsed < 6],
+            ["name": "manual_lookup_timeout_recovers", "passed": manualFinished && manualFailed && manualElapsed < 4],
             ["name": "cancel_suppresses_callbacks", "passed": staleCallbacks == 0]
         ]
         let report: [String: Any] = ["passed": checks.allSatisfy { $0["passed"] as? Bool == true }, "checks": checks, "elapsedSeconds": elapsed, "deviceIDs": devices.map(\.deviceID), "error": scanError ?? "", "realModuleVerified": false, "scope": "live_network_scan_timeout_and_cancellation", "timestamp": ISO8601DateFormatter().string(from: Date())]

@@ -67,6 +67,14 @@ enum CameraModuleNetworkProtocol {
     static let maximumFrameSize = 8 * 1024 * 1024
     private static let defaultSeed = Data("A2r0i1m1a2M0a1x6toriQue".utf8)
 
+    static func manualAddress(_ value: String) throws -> String {
+        let address = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let parsed = ipv4(address), unicast(parsed), address == [24, 16, 8, 0].map({ String((parsed >> $0) & 255) }).joined(separator: ".") else {
+            throw moduleNetworkFailure("请输入有效的 IPv4 地址，例如 192.168.1.100。")
+        }
+        return address
+    }
+
     static func discovery(deviceID: String? = nil) throws -> Data {
         var fields = ["cmd": "Discovery"]
         if let deviceID {
@@ -81,8 +89,8 @@ enum CameraModuleNetworkProtocol {
         return try encode(command: 2600, sequence: 1, body: deviceID.map { stringField(1, $0) } ?? Data(), udp: true)
     }
 
-    static func discoveryResponse(_ data: Data, address: String, sourcePort: Int, expectedID: String? = nil) throws -> CameraModuleNetworkTarget {
-        guard data.count > 0, data.count <= 4096, (1...65535).contains(sourcePort), let source = ipv4(address), unicast(source) else {
+    static func discoveryResponse(_ data: Data, address: String, sourcePort: Int, expectedID: String? = nil, expectedAddress: String? = nil) throws -> CameraModuleNetworkTarget {
+        guard data.count > 0, data.count <= 4096, (1...65535).contains(sourcePort), let source = ipv4(address), unicast(source), expectedAddress == nil || address == expectedAddress else {
             throw moduleNetworkFailure("发现响应的来源不正确。")
         }
         if data.starts(with: [0x51, 0x70]) {
@@ -265,6 +273,28 @@ final class CameraModuleNetwork {
     private var sockets: Set<Int32> = []
     private var sessionKey = Data()
 
+    func find(address: String, timeout: TimeInterval = 8, completion: @escaping (Result<CameraModuleNetworkDevice, Error>) -> Void) {
+        stop()
+        lock.lock()
+        let request = generation
+        lock.unlock()
+        queue.async {
+            let result: Result<CameraModuleNetworkDevice, Error>
+            do {
+                var found: CameraModuleNetworkDevice?
+                try self.scan(expectedID: nil, destinationAddress: address, timeout: timeout, request: request) { target in
+                    found = target.device
+                    return false
+                }
+                guard let found else { throw moduleNetworkFailure("该 IP 未返回有效的摄像头模块信息，请检查地址、模块供电和网络连接后重试。") }
+                result = .success(found)
+            } catch { result = .failure(error) }
+            DispatchQueue.main.async {
+                if self.current(request) { completion(result) }
+            }
+        }
+    }
+
     func scanNearby(timeout: TimeInterval = 8, onDevice: @escaping (CameraModuleNetworkDevice) -> Void, completion: @escaping (String?) -> Void) {
         stop()
         lock.lock()
@@ -419,19 +449,25 @@ final class CameraModuleNetwork {
 
     private func discover(identity: CameraModuleIdentity, request: Int) throws -> CameraModuleNetworkTarget {
         var result: CameraModuleNetworkTarget?
-        try scan(expectedID: identity.deviceID, timeout: 45, request: request) { target in
+        try scan(expectedID: identity.deviceID, destinationAddress: identity.address, timeout: identity.address == nil ? 45 : 8, request: request) { target in
             result = target
             return false
         }
-        guard let result else { throw moduleNetworkFailure(current(request) ? "摄像头模块尚未出现在当前局域网。请确认模块已连上与 Mac 相通的 2.4 GHz Wi-Fi。" : "模块连接已取消。") }
+        guard let result else { throw moduleNetworkFailure(current(request) ? (identity.address == nil ? "摄像头模块尚未出现在当前局域网。请确认模块已连上与 Mac 相通的 2.4 GHz Wi-Fi。" : "指定 IP 未返回该模块，请检查地址是否变化后重新查找。") : "模块连接已取消。") }
         return result
     }
 
-    private func scan(expectedID: String?, timeout: TimeInterval, request: Int, receive: (CameraModuleNetworkTarget) -> Bool) throws {
+    private func scan(expectedID: String?, destinationAddress: String? = nil, timeout: TimeInterval, request: Int, receive: (CameraModuleNetworkTarget) -> Bool) throws {
         let packet = try CameraModuleNetworkProtocol.discovery(deviceID: expectedID)
         let binaryPacket = try CameraModuleNetworkProtocol.binaryDiscovery(deviceID: expectedID)
         let networks = interfaces()
-        guard !networks.isEmpty else { throw moduleNetworkFailure("没有可用于发现摄像头模块的局域网连接。") }
+        let directAddress = try destinationAddress.map { try CameraModuleNetworkProtocol.manualAddress($0) }
+        let directValue = directAddress.flatMap(CameraModuleNetworkProtocol.ipv4)
+        guard directValue != nil || !networks.isEmpty else { throw moduleNetworkFailure("没有可用于发现摄像头模块的局域网连接。") }
+        if let directValue, networks.contains(where: { directValue == $0.broadcast || directValue == $0.address & $0.mask }) {
+            throw moduleNetworkFailure("请输入摄像头模块的 IP，不能使用网段或广播地址。")
+        }
+        let destinations = directValue.map { [$0] } ?? networks.map(\.broadcast)
         let descriptor = try openSocket(SOCK_DGRAM, request: request)
         defer { closeSocket(descriptor) }
         var enabled: Int32 = 1
@@ -444,8 +480,8 @@ final class CameraModuleNetwork {
         var discovered: Set<String> = []
         while current(request), Date() < deadline {
             if Date() >= nextSend {
-                for network in networks {
-                    var destination = address(network.broadcast, port: 20190)
+                for destinationValue in destinations {
+                    var destination = address(destinationValue, port: 20190)
                     for outgoing in [packet, binaryPacket] {
                         outgoing.withUnsafeBytes { bytes in
                             withUnsafePointer(to: &destination) { pointer in
@@ -468,12 +504,14 @@ final class CameraModuleNetwork {
             }
             guard count > 0, count <= 4096 else { continue }
             let candidate = UInt32(bigEndian: source.sin_addr.s_addr)
-            guard networks.contains(where: { $0.contains(candidate) }) else { continue }
+            if let directValue {
+                guard candidate == directValue else { continue }
+            } else if !networks.contains(where: { $0.contains(candidate) }) { continue }
             var text = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
             guard inet_ntop(AF_INET, &source.sin_addr, &text, socklen_t(text.count)) != nil else { continue }
             let response = Data(bytes.prefix(count))
             do {
-                let target = try CameraModuleNetworkProtocol.discoveryResponse(response, address: String(cString: text), sourcePort: Int(UInt16(bigEndian: source.sin_port)), expectedID: expectedID)
+                let target = try CameraModuleNetworkProtocol.discoveryResponse(response, address: String(cString: text), sourcePort: Int(UInt16(bigEndian: source.sin_port)), expectedID: expectedID, expectedAddress: directAddress)
                 if discovered.insert(target.device.deviceID).inserted, !receive(target) { return }
             } catch {
                 if let document = try? JSONSerialization.jsonObject(with: response) as? [String: Any],

@@ -4,12 +4,14 @@ import CoreLocation
 import CoreWLAN
 
 final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate, CLLocationManagerDelegate, NSWindowDelegate, NSTextFieldDelegate, NSComboBoxDelegate {
-    private let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 620, height: 390), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+    private let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 620, height: 470), styleMask: [.titled, .closable], backing: .buffered, defer: false)
     private let modulePicker = NSPopUpButton(frame: .zero, pullsDown: false)
     private let scanButton = NSButton(title: "重新扫描", target: nil, action: nil)
     private let wifiName = NSComboBox()
     private let wifiRefresh = NSButton(title: "刷新", target: nil, action: nil)
     private let password = WiFiPasswordField(frame: .zero)
+    private let ipAddress = NSTextField()
+    private let findButton = NSButton(title: "查找", target: nil, action: nil)
     private let status = NSTextField(wrappingLabelWithString: "正在准备蓝牙…")
     private let connectButton = NSButton(title: "连接 Wi-Fi", target: nil, action: nil)
     private let cancelButton = NSButton(title: "关闭", target: nil, action: nil)
@@ -19,6 +21,8 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
     private var modules: [CBPeripheral] = []
     private var moduleNames: [UUID: String] = [:]
     private var networkModules: [CameraModuleNetworkDevice] = []
+    private var manualAddresses: [String: String] = [:]
+    private var manualSearching = false
     private var selectedNetworkCandidate: CameraModuleNetworkDevice?
     private let networkScanner = CameraModuleNetwork()
     private var networkScanning = false
@@ -44,7 +48,7 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
     private let knownIdentifiers: [UUID]
     var onConfigured: ((CameraModuleIdentity) -> Void)?
     var onCancelNetwork: (() -> Void)?
-    var onNetworkFound: ((CameraModuleNetworkDevice) -> Void)?
+    var onNetworkFound: ((CameraModuleNetworkDevice, String?) -> Void)?
 
     init(knownIdentifiers: [UUID] = []) {
         self.knownIdentifiers = knownIdentifiers
@@ -53,8 +57,13 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
         buildPanel()
     }
 
-    func present(for parent: NSWindow, existingDeviceID: String? = nil) {
+    func present(for parent: NSWindow, existingDeviceID: String? = nil, savedDevices: [CameraModuleNetworkDevice] = []) {
         presented = true
+        for device in savedDevices {
+            manualAddresses[device.deviceID] = device.address
+            if let index = networkModules.firstIndex(where: { $0.deviceID == device.deviceID }) { networkModules[index] = device }
+            else { networkModules.append(device) }
+        }
         if panel.sheetParent == nil { parent.beginSheet(panel) }
         panel.makeKeyAndOrderFront(nil)
         if let existingDeviceID {
@@ -81,7 +90,8 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
         let moduleLabel = NSTextField(labelWithString: "摄像头")
         let wifiLabel = NSTextField(labelWithString: "Wi-Fi")
         let passwordLabel = NSTextField(labelWithString: "密码")
-        for label in [moduleLabel, wifiLabel, passwordLabel] {
+        let ipLabel = NSTextField(labelWithString: "IP 地址")
+        for label in [moduleLabel, wifiLabel, passwordLabel, ipLabel] {
             label.textColor = .secondaryLabelColor
             label.font = .systemFont(ofSize: 13)
         }
@@ -102,6 +112,12 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
         password.delegate = self
         password.placeholderString = "Wi-Fi 密码"
         password.setAccessibilityLabel("Wi-Fi 密码")
+        ipAddress.delegate = self
+        ipAddress.placeholderString = "例如 192.168.1.100"
+        ipAddress.setAccessibilityLabel("摄像头 IP 地址")
+        findButton.target = self
+        findButton.action = #selector(findModule)
+        findButton.setAccessibilityLabel("按 IP 查找摄像头")
         status.textColor = .secondaryLabelColor
         status.font = .systemFont(ofSize: 12)
         status.setAccessibilityLabel("模块连接状态")
@@ -112,7 +128,7 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
         cancelButton.target = self
         cancelButton.action = #selector(closePanel)
         cancelButton.keyEquivalent = "\u{1b}"
-        for view in [title, moduleLabel, modulePicker, scanButton, wifiLabel, wifiName, wifiRefresh, passwordLabel, password, status, cancelButton, connectButton] {
+        for view in [title, moduleLabel, modulePicker, scanButton, wifiLabel, wifiName, wifiRefresh, passwordLabel, password, ipLabel, ipAddress, findButton, status, cancelButton, connectButton] {
             view.translatesAutoresizingMaskIntoConstraints = false
             root.addSubview(view)
         }
@@ -139,9 +155,17 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
             password.leadingAnchor.constraint(equalTo: wifiRefresh.trailingAnchor, constant: 18),
             password.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -28),
             password.centerYAnchor.constraint(equalTo: wifiName.centerYAnchor),
+            ipLabel.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            ipLabel.topAnchor.constraint(equalTo: wifiName.bottomAnchor, constant: 22),
+            ipAddress.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            ipAddress.topAnchor.constraint(equalTo: ipLabel.bottomAnchor, constant: 8),
+            ipAddress.trailingAnchor.constraint(equalTo: findButton.leadingAnchor, constant: -12),
+            findButton.trailingAnchor.constraint(equalTo: scanButton.trailingAnchor),
+            findButton.widthAnchor.constraint(equalTo: scanButton.widthAnchor),
+            findButton.centerYAnchor.constraint(equalTo: ipAddress.centerYAnchor),
             status.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             status.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -28),
-            status.topAnchor.constraint(equalTo: wifiName.bottomAnchor, constant: 26),
+            status.topAnchor.constraint(equalTo: ipAddress.bottomAnchor, constant: 22),
             connectButton.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -28),
             connectButton.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -24),
             cancelButton.trailingAnchor.constraint(equalTo: connectButton.leadingAnchor, constant: -12),
@@ -150,6 +174,7 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
     }
 
     func controlTextDidChange(_ notification: Notification) {
+        if notification.object as? NSTextField === ipAddress { updateControls(); return }
         configured = false
         if ready, !busy {
             status.stringValue = CameraModuleProtocol.validateCredentials(ssid: wifiName.stringValue, password: password.stringValue) ?? "蓝牙已连接，可以发送 Wi-Fi 配置。"
@@ -163,6 +188,9 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
     private func updateControls() {
         modulePicker.isEnabled = !busy && (!modules.isEmpty || !networkModules.isEmpty)
         scanButton.isEnabled = !busy
+        ipAddress.isEnabled = !busy
+        findButton.isEnabled = !busy && (try? CameraModuleNetworkProtocol.manualAddress(ipAddress.stringValue)) != nil
+        findButton.title = manualSearching ? "查找中…" : "查找"
         wifiName.isEnabled = !busy && configuredIdentity == nil && selectedNetworkCandidate == nil
         password.isEnabled = !busy && configuredIdentity == nil && selectedNetworkCandidate == nil
         wifiRefresh.isEnabled = !busy && configuredIdentity == nil && selectedNetworkCandidate == nil
@@ -206,7 +234,7 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        guard presented else { return }
+        guard presented, !busy else { return }
         NSLog("Module Bluetooth state=%ld authorization=%ld", central.state.rawValue, CBManager.authorization.rawValue)
         switch central.state {
         case .poweredOn: beginBluetoothScan()
@@ -219,6 +247,43 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
     }
 
     @objc private func scanAgain() { startScan() }
+
+    @objc private func findModule() {
+        guard !busy else { return }
+        let address: String
+        do { address = try CameraModuleNetworkProtocol.manualAddress(ipAddress.stringValue) }
+        catch { status.stringValue = error.localizedDescription; return }
+        ipAddress.stringValue = address
+        request += 1
+        scanRequest += 1
+        let current = request
+        manager?.stopScan()
+        scanning = false
+        networkScanning = false
+        manualSearching = true
+        busy = true
+        status.stringValue = "正在查找 \(address)…"
+        updateControls()
+        networkScanner.find(address: address) { [weak self] result in
+            guard let self, self.presented, current == self.request else { return }
+            self.manualSearching = false
+            self.busy = false
+            switch result {
+            case .success(let device):
+                self.manualAddresses[device.deviceID] = address
+                if let index = self.networkModules.firstIndex(where: { $0.deviceID == device.deviceID }) { self.networkModules[index] = device }
+                else { self.networkModules.append(device) }
+                self.onNetworkFound?(device, address)
+                self.rebuildModulePicker()
+                if let index = self.modulePicker.itemArray.firstIndex(where: { $0.representedObject as? String == "network:\(device.deviceID)" }) {
+                    self.modulePicker.selectItem(at: index)
+                    self.selectModule()
+                }
+            case .failure(let error): self.status.stringValue = error.localizedDescription
+            }
+            self.updateControls()
+        }
+    }
 
     private func startScan() {
         guard !busy else { return }
@@ -237,21 +302,23 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
         ready = preserved != nil
         if preserved == nil { writeCharacteristic = nil; subscriptions.removeAll() }
         modules = preserved.map { [$0] } ?? []
-        networkModules.removeAll()
+        networkModules = networkModules.filter { manualAddresses[$0.deviceID] != nil }
         bluetoothIssue = nil
         modulePicker.removeAllItems()
         modulePicker.addItem(withTitle: "正在扫描…")
         scanning = false
         networkScanning = true
         status.stringValue = manager.state == .poweredOn ? "正在搜索蓝牙和局域网模块…" : bluetoothPreparationMessage()
-        if preserved != nil { rebuildModulePicker() }
+        if preserved != nil || !networkModules.isEmpty { rebuildModulePicker() }
         updateControls()
         let currentScan = scanRequest
         networkScanner.scanNearby(onDevice: { [weak self] device in
             guard let self, currentScan == self.scanRequest, self.presented else { return }
             if let index = self.networkModules.firstIndex(where: { $0.deviceID == device.deviceID }) { self.networkModules[index] = device }
             else { self.networkModules.append(device) }
-            self.onNetworkFound?(device)
+            if self.manualAddresses[device.deviceID] != nil { self.manualAddresses[device.deviceID] = device.address }
+            if self.selectedNetworkCandidate?.deviceID == device.deviceID { self.selectedNetworkCandidate = device }
+            self.onNetworkFound?(device, nil)
             self.rebuildModulePicker()
         }, completion: { [weak self] error in
             guard let self, currentScan == self.scanRequest else { return }
@@ -356,7 +423,7 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
             configuredIdentity = nil
             ready = false
             password.stringValue = ""
-            status.stringValue = "已发现联网模块，可直接打开画面，无需再次配网。"
+            status.stringValue = "可连接摄像头模块 · \(device.address)"
             updateControls()
             return
         }
@@ -442,7 +509,7 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
 
     @objc private func connectWiFi() {
         guard !busy else { return }
-        if let device = selectedNetworkCandidate { beginNetworkConnection(CameraModuleIdentity(deviceID: device.deviceID, salt: "")); return }
+        if let device = selectedNetworkCandidate { beginNetworkConnection(CameraModuleIdentity(deviceID: device.deviceID, salt: "", address: manualAddresses[device.deviceID])); return }
         if let configuredIdentity { beginNetworkConnection(configuredIdentity); return }
         guard ready, selected != nil else { return }
         if let message = CameraModuleProtocol.validateCredentials(ssid: wifiName.stringValue, password: password.stringValue) {
@@ -530,6 +597,7 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
         scanRequest += 1
         ready = false
         busy = false
+        manualSearching = false
         networkConnecting = false
         pendingPackets.removeAll()
         manager?.stopScan()
@@ -551,6 +619,7 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
         scanning = false
         ready = false
         busy = false
+        manualSearching = false
         if networkConnecting { onCancelNetwork?() }
         networkConnecting = false
         pendingPackets.removeAll()
@@ -618,6 +687,36 @@ final class CameraModuleConnection: NSObject, CBCentralManagerDelegate, CBPeriph
             self.modulePicker.sendAction(self.modulePicker.action, to: self.modulePicker.target)
             guard self.connectButton.isEnabled else { return }
             timer.invalidate()
+            self.connectButton.performClick(nil)
+        }
+    }
+
+    func runManualE2E(address: String, directory: URL) {
+        var checks: [[String: Any]] = []
+        for value in ["", "camera.local", "127.0.0.1", "192.0.2.1:20190"] {
+            ipAddress.stringValue = value
+            controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: ipAddress))
+            checks.append(["name": "invalid_input_\(checks.count)", "passed": !findButton.isEnabled])
+        }
+        ipAddress.stringValue = address
+        controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: ipAddress))
+        checks.append(["name": "valid_input_enabled", "passed": findButton.isEnabled])
+        findButton.performClick(nil)
+        checks.append(["name": "duplicate_lookup_disabled", "passed": !findButton.isEnabled && !ipAddress.isEnabled && cancelButton.isEnabled])
+        testTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { timer in
+            guard self.selectedNetworkCandidate?.address == address, self.manualAddresses[self.selectedNetworkCandidate?.deviceID ?? ""] == address, !self.busy else { return }
+            timer.invalidate()
+            checks.append(["name": "manual_module_selected", "passed": self.connectButton.isEnabled && self.connectButton.title == "打开画面" && !self.wifiName.isEnabled && !self.password.isEnabled])
+            if let root = self.panel.contentView {
+                root.layoutSubtreeIfNeeded()
+                checks.append(["name": "controls_inside_window", "passed": [self.ipAddress, self.findButton, self.status, self.connectButton].allSatisfy { root.bounds.contains($0.frame) } && self.ipAddress.frame.minY > self.status.frame.maxY && self.status.frame.minY > self.connectButton.frame.maxY])
+                if let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) {
+                    root.cacheDisplay(in: root.bounds, to: bitmap)
+                    try? bitmap.representation(using: .png, properties: [:])?.write(to: directory.appendingPathComponent("manual-window.png"))
+                }
+            }
+            let report: [String: Any] = ["passed": checks.allSatisfy { $0["passed"] as? Bool == true }, "checks": checks]
+            try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]).write(to: directory.appendingPathComponent("manual-controls.json"))
             self.connectButton.performClick(nil)
         }
     }

@@ -38,6 +38,13 @@ struct CameraModuleNetworkCheck {
         check("json_discovery_filters_full_id", try JSONSerialization.jsonObject(with: CameraModuleNetworkProtocol.discovery(deviceID: "fixture-device")) as? [String: String] == ["cmd": "Discovery", "did": "fixture-device"])
         check("discovery_without_saved_id", try JSONSerialization.jsonObject(with: CameraModuleNetworkProtocol.discovery()) as? [String: String] == ["cmd": "Discovery"])
         check("binary_discovery_without_saved_id", try CameraModuleNetworkProtocol.binaryDiscovery() == bytes("5170480401a8140c"))
+        check("manual_address_trimmed", try CameraModuleNetworkProtocol.manualAddress(" 192.0.2.222\n") == "192.0.2.222")
+        check("routed_manual_address_allowed", try CameraModuleNetworkProtocol.manualAddress("10.32.1.10") == "10.32.1.10")
+        for address in ["", "  ", "camera.local", "http://192.0.2.1", "192.0.2.1:20190", "::1", "127.0.0.1", "0.0.0.0", "224.0.0.1", "255.255.255.255", "192.0.2", "192.0.2.256", "192.00.2.1", "192.0.2.1\n10.0.0.1"] {
+            reject("manual_address_invalid_\(checks.count)") { _ = try CameraModuleNetworkProtocol.manualAddress(address) }
+        }
+        check("automatic_identity_has_no_address", CameraModuleIdentity(deviceID: "fixture-device", salt: "").address == nil)
+        check("manual_identity_retains_address", CameraModuleIdentity(deviceID: "fixture-device", salt: "", address: "192.0.2.222").address == "192.0.2.222")
         check("advertised_name_overrides_stale_cache", CameraModuleDiscovery.bluetoothName(advertised: "LLM_HA10_FIXTURE", cached: "Old device") == "LLM_HA10_FIXTURE")
         check("empty_cache_does_not_hide_advertisement", CameraModuleDiscovery.bluetoothName(advertised: "AXH_HA10_FIXTURE", cached: "") == "AXH_HA10_FIXTURE")
         check("known_cache_used_when_advertisement_incomplete", CameraModuleDiscovery.bluetoothName(advertised: nil, cached: "LLM_HA10_FIXTURE") == "LLM_HA10_FIXTURE")
@@ -48,6 +55,8 @@ struct CameraModuleNetworkCheck {
         let target = try CameraModuleNetworkProtocol.discoveryResponse(responseData, address: "192.168.1.20", sourcePort: 20190, expectedID: "fixture-device")
         check("matching_discovery_accepted", target.device.deviceID == "fixture-device" && target.device.address == "192.168.1.20" && target.device.port == 20190)
         check("network_device_identified_without_history", try CameraModuleNetworkProtocol.discoveryResponse(responseData, address: "192.168.1.20", sourcePort: 20190).device.deviceID == "fixture-device")
+        check("manual_source_accepted", try CameraModuleNetworkProtocol.discoveryResponse(responseData, address: "192.168.1.20", sourcePort: 20190, expectedAddress: "192.168.1.20").device.deviceID == "fixture-device")
+        reject("manual_other_source_rejected") { _ = try CameraModuleNetworkProtocol.discoveryResponse(responseData, address: "192.168.1.21", sourcePort: 20190, expectedAddress: "192.168.1.20") }
         reject("wrong_device_rejected") { _ = try CameraModuleNetworkProtocol.discoveryResponse(responseData, address: "192.168.1.20", sourcePort: 20190, expectedID: "another-device") }
         check("nat_source_address_used", try CameraModuleNetworkProtocol.discoveryResponse(responseData, address: "192.168.1.21", sourcePort: 20190, expectedID: "fixture-device").device.address == "192.168.1.21")
         check("ephemeral_source_port_accepted", try CameraModuleNetworkProtocol.discoveryResponse(responseData, address: "192.168.1.20", sourcePort: 49152, expectedID: "fixture-device").device.port == 20190)
@@ -55,6 +64,7 @@ struct CameraModuleNetworkCheck {
         let binary = bytes(document["binaryDiscoveryResponseHex"] as! String)
         let binaryTarget = try CameraModuleNetworkProtocol.discoveryResponse(binary, address: "192.168.1.20", sourcePort: 20190, expectedID: "fixture-device")
         check("binary_device_identified_without_history", try CameraModuleNetworkProtocol.discoveryResponse(binary, address: "192.168.1.20", sourcePort: 20190).device.deviceID == "fixture-device")
+        reject("binary_manual_other_source_rejected") { _ = try CameraModuleNetworkProtocol.discoveryResponse(binary, address: "192.168.1.21", sourcePort: 20190, expectedAddress: "192.168.1.20") }
         check("binary_discovery_with_nat", binaryTarget.device.address == "192.168.1.20" && binaryTarget.device.deviceID == "fixture-device")
         check("changed_ip_is_taken_from_new_response", try CameraModuleNetworkProtocol.discoveryResponse(binary, address: "192.0.2.222", sourcePort: 20190, expectedID: "fixture-device").device.address == "192.0.2.222")
         reject("binary_wrong_device_rejected") { _ = try CameraModuleNetworkProtocol.discoveryResponse(binary, address: "192.168.1.20", sourcePort: 20190, expectedID: "different-device") }

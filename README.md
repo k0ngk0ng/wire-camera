@@ -3,7 +3,7 @@
 Mac 原生摄像头预览工具。双击「应用程序」中的 **WireCamera.app**（安装路径：`/Applications/WireCamera.app`），或打开项目目录中的同名应用，首次运行在系统提示中允许摄像头访问，即可查看实时画面。
 
 - 自动优先选择外接 USB 摄像头，可在右上角切换设备。
-- 支持通过蓝牙为 HA10 摄像头模块配置 2.4 GHz Wi-Fi，自动发现已联网模块并在局域网内预览画面。
+- 支持通过蓝牙为 HA10 摄像头模块配置 2.4 GHz Wi-Fi，自动发现或按 IP 查找模块，并在局域网内预览画面。
 - 支持镜像、调整窗口大小、全屏（⌃⌘F），按原始比例显示画面。
 - 支持切换摄像头原生 4:3 / 16:9 画面模式，预览与录制使用相同尺寸。
 - 支持拔插设备自动重连；⌘R 重新连接。
@@ -21,6 +21,10 @@ Mac 原生摄像头预览工具。双击「应用程序」中的 **WireCamera.ap
 已经配过 Wi-Fi 的模块不需要再次进入蓝牙配网状态。启动 WireCamera 后，可在右上角选择自动发现的 `Wi-Fi · 设备ID`；也可点击「添加摄像头」，选择 Wi-Fi 模块后点击「打开画面」。Mac 与模块所在网络需要互通。
 
 程序通过局域网广播发现模块，按设备 ID 识别设备，并使用回复数据包的来源 IP 连接。IP 地址变化后会在下次发现时更新，不需要固定 IP、手动输入地址或保留上次的连接记录。
+
+自动搜索无结果时，点击「添加摄像头」，在「IP 地址」中输入模块的 IPv4 地址，再点击「查找」。找到模块后，点击「打开画面」。此操作直接查询指定 IP，不需要蓝牙广播；Mac 必须能通过网络访问该地址。若模块离线或 IP 已变化，查找会显示失败，可修改地址后重试。
+
+手动找到的模块和成功连接的模块会自动保存在本机。重新打开应用后，设备列表直接显示保存的模块；即使模块离线也会保留，选择设备即可按已保存的 IP 重新连接。相同设备 ID 的新地址会更新已有记录。记录位于 `~/Library/Application Support/WireCamera/modules.json`，仅保存设备 ID 和 IP，不保存 Wi-Fi 密码、设备签名或会话密钥。
 
 首次配网：
 
@@ -107,6 +111,9 @@ zsh Tests/picture-mode-e2e.sh
 zsh Tests/module-connection-e2e.sh
 WIRECAMERA_MODULE_DEVICE_ID="设备ID" zsh Tests/module-discovery-e2e.sh
 WIRECAMERA_MODULE_DEVICE_ID="设备ID" zsh Tests/module-preview-e2e.sh
+WIRECAMERA_MODULE_ADDRESS="模块IP" zsh Tests/module-manual-e2e.sh
+zsh Tests/module-manual-fixture-e2e.sh
+zsh Tests/module-store-check.sh
 zsh Tests/module-scan-e2e.sh
 zsh Tests/password-field-e2e.sh
 zsh Tests/module-protocol-check.sh
@@ -117,5 +124,7 @@ zsh Tests/module-video-check.sh
 模块预览 E2E 验证真实视频解码与主界面显示，实际执行一次「重试」，再次持续显示 12 秒后才通过。实际画面、JSON 报告和日志位于 `.build/module-preview-e2e/`。配网、报文和网络失败场景分别见 `Tests/module-connection-scenarios.md`、`Tests/module-protocol-scenarios.md`、`Tests/module-network-scenarios.md` 和 `Tests/module-preview-scenarios.md`。
 
 无记录发现 E2E 不向应用传入 IP、设备 ID 或蓝牙标识，通过实际连接窗口发现局域网模块、打开画面并执行重试。环境变量中的设备 ID 仅用于核对结果；可将应用路径作为第一个参数，以验证已安装版本。画面、JSON 报告和日志位于 `.build/module-discovery-e2e/`。扫描 E2E 使用真实网络套接字验证超时和取消后的回调行为，报告位于 `.build/module-scan-e2e/`；此项不要求发现真实模块。
+
+手动 IP E2E 通过真实窗口输入地址，验证输入校验、查找、预览和重试，产物位于 `.build/module-manual-e2e/`。模拟模块 E2E 在本机网络地址提供合成 MJPEG，执行相同流程后退出应用，再关闭自动扫描、重启应用并从保存的设备列表连接；产物位于 `.build/module-manual-fixture-e2e/` 和 `.build/module-saved-e2e/`。模拟测试不代表摄像头实机已在线。测试使用项目内独立设备文件，不修改日常使用的设备记录。
 
 Swift 命名与禁用写法由 `.swiftlint.yml` 检查，目录、文件命名和 Zsh 语法由 `scripts/lint.sh` 检查。安装 SwiftLint 后运行 `zsh scripts/lint.sh`，或通过 `WIRECAMERA_SWIFTLINT` 指定其路径。

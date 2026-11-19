@@ -103,8 +103,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let moduleScanner = CameraModuleNetwork()
     private var discoveredModuleIDs: Set<String> = []
     private var discoveryTesting = false
+    private var savedModuleTesting = false
     private var selectedNetworkModule: CameraModuleNetworkDevice?
-    private var knownNetworkModule: CameraModuleNetworkDevice?
+    private var networkModules: [CameraModuleNetworkDevice] = []
+    private lazy var moduleStore: CameraModuleStore = {
+        let arguments = CommandLine.arguments
+        if let index = arguments.firstIndex(of: "--module-store-path"), arguments.indices.contains(index + 1) {
+            return CameraModuleStore(fileURL: URL(fileURLWithPath: arguments[index + 1]))
+        }
+        return CameraModuleStore(fileURL: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/WireCamera/modules.json"))
+    }()
     private var moduleIdentity: CameraModuleIdentity?
     private var modulePreviewTestDirectory: URL?
     private var modulePreviewSample: CMSampleBuffer?
@@ -171,6 +179,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             modulePreviewTestDirectory = URL(fileURLWithPath: CommandLine.arguments[index + 1])
             discoveryTesting = true
         }
+        if let index = CommandLine.arguments.firstIndex(of: "--module-manual-e2e"), CommandLine.arguments.indices.contains(index + 1) {
+            modulePreviewTestDirectory = URL(fileURLWithPath: CommandLine.arguments[index + 1])
+        }
+        if let index = CommandLine.arguments.firstIndex(of: "--module-saved-e2e"), CommandLine.arguments.indices.contains(index + 1) {
+            modulePreviewTestDirectory = URL(fileURLWithPath: CommandLine.arguments[index + 1])
+            savedModuleTesting = true
+        }
+        networkModules = moduleStore.devices
+        updateNetworkPicker()
+        updateRecordingControls()
         if let index = CommandLine.arguments.firstIndex(of: "--check-ui"),
            CommandLine.arguments.indices.contains(index + 1) {
             let root = window.contentView!
@@ -237,7 +255,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        moduleScanner.scanNearby(onDevice: { [weak self] device in self?.registerNearbyModule(device) }, completion: { _ in })
+        if !savedModuleTesting { moduleScanner.scanNearby(onDevice: { [weak self] device in self?.registerNearbyModule(device) }, completion: { _ in }) }
         if moduleTestDirectory == nil && modulePreviewTestDirectory == nil && !CommandLine.arguments.contains("--add-camera") { requestCamera() }
         recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             guard let self, let started = self.recordingStarted else { return }
@@ -253,8 +271,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             addModule.performClick(nil)
         }
         if modulePreviewTestDirectory != nil {
-            addModule.performClick(nil)
+            if savedModuleTesting, !networkModules.isEmpty {
+                picker.selectItem(at: 0)
+                picker.sendAction(picker.action, to: picker.target)
+            } else { addModule.performClick(nil) }
             if discoveryTesting { moduleConnection?.runDiscoveryE2E() }
+            if CommandLine.arguments.contains("--module-manual-e2e"), let directory = modulePreviewTestDirectory,
+               let index = CommandLine.arguments.firstIndex(of: "--module-address"), CommandLine.arguments.indices.contains(index + 1) {
+                moduleConnection?.runManualE2E(address: CommandLine.arguments[index + 1], directory: directory)
+            }
             runModulePreviewE2E()
         }
     }
@@ -466,7 +491,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         devices = cameraDevices()
         picker.removeAllItems()
-        if let knownNetworkModule { picker.addItem(withTitle: "Wi-Fi · \(knownNetworkModule.deviceID)") }
+        networkModules.forEach { picker.addItem(withTitle: "Wi-Fi · \($0.deviceID)") }
         devices.forEach { picker.addItem(withTitle: $0.localizedName) }
         picker.isEnabled = !devices.isEmpty
         guard !devices.isEmpty else {
@@ -481,7 +506,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         let index = devices.firstIndex { $0.uniqueID == selectedID } ?? 0
-        picker.selectItem(at: index + (knownNetworkModule == nil ? 0 : 1))
+        picker.selectItem(at: index + networkModules.count)
         if force || devices[index].uniqueID != selectedID { startCamera(devices[index]) }
         else { refreshAudioDevice() }
     }
@@ -500,7 +525,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         selectedPictureMode = pictureModes[selectedIndex]
         picturePicker.selectItem(at: selectedIndex)
         selectedID = device.uniqueID
-        if knownNetworkModule != nil { updateNetworkPicker() }
+        if !networkModules.isEmpty { updateNetworkPicker() }
         listen.state = .off
         awaitingFrames = true
         refreshAudioDevice()
@@ -531,12 +556,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func selectCamera() {
-        if knownNetworkModule != nil {
-            if picker.indexOfSelectedItem == 0 {
-                if let moduleIdentity { beginModuleConnection(moduleIdentity) }
+        if !networkModules.isEmpty {
+            if networkModules.indices.contains(picker.indexOfSelectedItem) {
+                let device = networkModules[picker.indexOfSelectedItem]
+                let address = moduleStore.devices.contains(where: { $0.deviceID == device.deviceID }) ? device.address : nil
+                beginModuleConnection(CameraModuleIdentity(deviceID: device.deviceID, salt: "", address: address))
                 return
             }
-            let index = picker.indexOfSelectedItem - 1
+            let index = picker.indexOfSelectedItem - networkModules.count
             guard devices.indices.contains(index) else { return }
             let device = devices[index]
             moduleNetwork.stop()
@@ -573,44 +600,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self?.beginModuleConnection(identity)
             }
             moduleConnection?.onCancelNetwork = { [weak self] in self?.moduleNetwork.stop() }
-            moduleConnection?.onNetworkFound = { [weak self] device in self?.registerNearbyModule(device) }
+            moduleConnection?.onNetworkFound = { [weak self] device, address in self?.registerNearbyModule(device, address: address) }
         }
         let arguments = CommandLine.arguments
         var existingDeviceID: String?
         if let index = arguments.firstIndex(of: "--module-device-id"), arguments.indices.contains(index + 1) { existingDeviceID = arguments[index + 1] }
-        moduleConnection?.present(for: window, existingDeviceID: existingDeviceID)
+        moduleConnection?.present(for: window, existingDeviceID: existingDeviceID, savedDevices: moduleStore.devices)
     }
     @objc private func toggleMirror() {
         preview.setMirrored(mirror.state == .on)
     }
 
     private func updateNetworkPicker() {
-        guard let device = knownNetworkModule else { return }
+        guard !networkModules.isEmpty else { return }
         picker.removeAllItems()
-        picker.addItem(withTitle: "Wi-Fi · \(device.deviceID)")
+        networkModules.forEach { picker.addItem(withTitle: "Wi-Fi · \($0.deviceID)") }
         devices.forEach { picker.addItem(withTitle: $0.localizedName) }
-        if selectedNetworkModule != nil { picker.selectItem(at: 0) }
-        else if let index = devices.firstIndex(where: { $0.uniqueID == selectedID }) { picker.selectItem(at: index + 1) }
+        if let selectedNetworkModule, let index = networkModules.firstIndex(where: { $0.deviceID == selectedNetworkModule.deviceID }) { picker.selectItem(at: index) }
+        else if let index = devices.firstIndex(where: { $0.uniqueID == selectedID }) { picker.selectItem(at: index + networkModules.count) }
     }
 
-    private func registerNearbyModule(_ device: CameraModuleNetworkDevice) {
+    private func registerNearbyModule(_ device: CameraModuleNetworkDevice, address: String? = nil) {
         discoveredModuleIDs.insert(device.deviceID)
-        guard knownNetworkModule == nil || knownNetworkModule?.deviceID == device.deviceID else { return }
-        knownNetworkModule = device
-        if moduleIdentity == nil { moduleIdentity = CameraModuleIdentity(deviceID: device.deviceID, salt: "") }
+        if let index = networkModules.firstIndex(where: { $0.deviceID == device.deviceID }) { networkModules[index] = device }
+        else { networkModules.append(device) }
+        if address != nil || moduleStore.devices.contains(where: { $0.deviceID == device.deviceID && $0.address != device.address }) { saveModule(device) }
+        if let selectedNetworkModule, selectedNetworkModule.deviceID == device.deviceID, moduleIdentity?.address != nil { moduleIdentity = CameraModuleIdentity(deviceID: device.deviceID, salt: "", address: device.address) }
         if !recordingBusy && !recordingPreparing { updateNetworkPicker(); updateRecordingControls() }
+    }
+
+    private func saveModule(_ device: CameraModuleNetworkDevice) {
+        do { try moduleStore.save(device) }
+        catch {
+            let message = "模块未能保存到本地：\(error.localizedDescription)"
+            moduleLastError = message
+            showMessage("无法保存摄像头模块", message)
+        }
     }
 
     private func beginModuleConnection(_ identity: CameraModuleIdentity) {
         moduleIdentity = identity
         moduleLastError = nil
-        let device = CameraModuleNetworkDevice(deviceID: identity.deviceID, address: "", port: 20190)
+        let device = CameraModuleNetworkDevice(deviceID: identity.deviceID, address: identity.address ?? "", port: 20190)
         moduleConnected(device)
         moduleNetwork.connect(identity: identity) { [weak self] result in
             guard let self else { return }
             self.moduleConnection?.networkConnectionFinished(result)
             switch result {
-            case .success(let device): self.moduleConnected(device)
+            case .success(let device):
+                self.moduleConnected(device)
+                self.saveModule(device)
             case .failure(let error):
                 self.moduleLastError = error.localizedDescription
                 self.showMessage("模块连接未完成", error.localizedDescription)
@@ -622,7 +661,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         camera.stop()
         generation += 1
         selectedNetworkModule = device
-        knownNetworkModule = device
+        if let index = networkModules.firstIndex(where: { $0.deviceID == device.deviceID }) { networkModules[index] = device }
+        else { networkModules.append(device) }
         selectedID = nil
         audioDevice = nil
         listen.state = .off
@@ -700,7 +740,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func updateRecordingControls() {
         let locked = recordingBusy || recordingPreparing
-        picker.isEnabled = !locked && (!devices.isEmpty || knownNetworkModule != nil)
+        picker.isEnabled = !locked && (!devices.isEmpty || !networkModules.isEmpty)
         picturePicker.isEnabled = !locked && !audioChanging && selectedID != nil && pictureModes.count > 1
         mirror.isEnabled = !locked
         retry.isEnabled = !locked
@@ -869,7 +909,7 @@ extension AppDelegate {
             if ready, !retried {
                 let identifier = self.selectedNetworkModule?.deviceID
                 self.reconnect()
-                retryKeptModule = self.selectedNetworkModule?.deviceID == identifier && self.picker.indexOfSelectedItem == 0
+                retryKeptModule = self.selectedNetworkModule?.deviceID == identifier && self.picker.selectedItem?.title == "Wi-Fi · \(identifier ?? "")"
                 retried = true
                 return
             }
@@ -895,6 +935,9 @@ extension AppDelegate {
                 "frameReports": self.modulePreviewReports, "previewSeconds": seconds,
                 "visibleRenderer": rendered, "frameSaved": frameSaved,
                 "retryKeptModule": retryKeptModule,
+                "manualAddressUsed": self.moduleIdentity?.address != nil && self.moduleIdentity?.address == self.selectedNetworkModule?.address,
+                "moduleSaved": self.moduleStore.devices.contains(where: { $0.deviceID == self.selectedNetworkModule?.deviceID && $0.address == self.selectedNetworkModule?.address }),
+                "restoredWithoutDiscovery": self.savedModuleTesting && self.discoveredModuleIDs.isEmpty,
                 "discoveredWithoutHistory": !CommandLine.arguments.contains("--module-device-id") && !CommandLine.arguments.contains("--module-identifier") && self.discoveredModuleIDs.contains(self.selectedNetworkModule?.deviceID ?? ""),
                 "moduleListed": self.picker.itemTitles.contains("Wi-Fi · \(self.selectedNetworkModule?.deviceID ?? "")"),
                 "error": failure ?? (ready ? "" : self.status.stringValue),
