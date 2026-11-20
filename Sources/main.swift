@@ -152,6 +152,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var recordingPreparing = false
     private var recordingFinishing = false
     private var recordingStarted: Date?
+    private var recordingSessionStartedUptime: TimeInterval?
+    private var recordingSessionElapsed: TimeInterval = 0
+    private let liveClock = NSTextField(labelWithString: "")
+    private let liveClockFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .autoupdatingCurrent
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return formatter
+    }()
     private var lastRecording: URL?
     private var lastRecordingError: String?
     private var savedRecordings = 0
@@ -303,9 +313,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if !savedModuleTesting && libraryTestDirectory == nil && !CommandLine.arguments.contains("--disable-module-scan") { moduleScanner.scanNearby(onDevice: { [weak self] device in self?.registerNearbyModule(device) }, completion: { _ in }) }
         if libraryTestDirectory == nil && moduleTestDirectory == nil && modulePreviewTestDirectory == nil && !CommandLine.arguments.contains("--add-camera") { requestCamera() }
         recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            guard let self, let started = self.recordingStarted else { return }
-            let seconds = Int(Date().timeIntervalSince(started))
-            self.recordingTime.stringValue = String(format: "%02d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
+            guard let self else { return }
+            self.liveClock.stringValue = self.liveClockFormatter.string(from: Date())
+            if self.recordingSessionStartedUptime != nil { self.recordingTime.stringValue = self.recordingElapsedText }
+            guard let started = self.recordingStarted else { return }
             let segmentSeconds: Double = self.libraryTestDirectory == nil || CommandLine.arguments.contains("--expect-audio-interruption") ? 60 : 4
             if self.recordingRequested && !self.recordingFinishing && Date().timeIntervalSince(started) >= segmentSeconds {
                 self.rotatingRecording = true
@@ -378,6 +389,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             root.addSubview(view)
         }
         playback.isHidden = true
+        playback.onToggleFullscreen = { [weak self] in self?.toggleFullscreen() }
         let title = NSTextField(labelWithString: "WireCamera")
         title.font = .systemFont(ofSize: 18, weight: .semibold)
         modePicker.selectedSegment = 0
@@ -456,7 +468,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         overlay.spacing = 18
         overlay.translatesAutoresizingMaskIntoConstraints = false
         preview.addSubview(overlay)
+        let clockBadge = NSView()
+        clockBadge.wantsLayer = true
+        clockBadge.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.6).cgColor
+        clockBadge.layer?.cornerRadius = 6
+        clockBadge.translatesAutoresizingMaskIntoConstraints = false
+        liveClock.translatesAutoresizingMaskIntoConstraints = false
+        liveClock.font = .monospacedDigitSystemFont(ofSize: 13, weight: .medium)
+        liveClock.textColor = .white
+        liveClock.setAccessibilityLabel("当前时间")
+        liveClock.stringValue = liveClockFormatter.string(from: Date())
+        clockBadge.addSubview(liveClock)
+        preview.addSubview(clockBadge)
         NSLayoutConstraint.activate([
+            clockBadge.topAnchor.constraint(equalTo: preview.topAnchor, constant: 16),
+            clockBadge.trailingAnchor.constraint(equalTo: preview.trailingAnchor, constant: -16),
+            liveClock.leadingAnchor.constraint(equalTo: clockBadge.leadingAnchor, constant: 10),
+            liveClock.trailingAnchor.constraint(equalTo: clockBadge.trailingAnchor, constant: -10),
+            liveClock.topAnchor.constraint(equalTo: clockBadge.topAnchor, constant: 7),
+            liveClock.bottomAnchor.constraint(equalTo: clockBadge.bottomAnchor, constant: -7),
             header.topAnchor.constraint(equalTo: root.topAnchor), header.leadingAnchor.constraint(equalTo: root.leadingAnchor), header.trailingAnchor.constraint(equalTo: root.trailingAnchor), header.heightAnchor.constraint(equalToConstant: 72),
             title.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 24), title.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             modePicker.leadingAnchor.constraint(equalTo: title.trailingAnchor, constant: 36), modePicker.centerYAnchor.constraint(equalTo: header.centerYAnchor),
@@ -795,6 +825,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func showRecordingError(_ message: String) {
         lastRecordingError = message
+        if !recordingRequested && recordingSessionStartedUptime != nil { freezeRecordingClock() }
         guard libraryTestDirectory == nil && recordingTestDirectory == nil && pictureTestDirectory == nil else { return }
         let alert = NSAlert()
         alert.messageText = "录制或声音操作未完成"
@@ -831,6 +862,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func changeVolume() { camera.setVolume(Float(volume.doubleValue)) }
 
+    private var recordingElapsedSeconds: TimeInterval {
+        recordingSessionStartedUptime.map { max(0, ProcessInfo.processInfo.systemUptime - $0) } ?? recordingSessionElapsed
+    }
+
+    private var recordingElapsedText: String {
+        let seconds = Int(recordingElapsedSeconds)
+        return String(format: "%02d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
+    }
+
+    private func freezeRecordingClock() {
+        recordingSessionElapsed = recordingElapsedSeconds
+        recordingSessionStartedUptime = nil
+        recordingTime.stringValue = recordingElapsedText
+    }
+
     @objc private func toggleRecording() {
         if recordingBusy || recordingPreparing {
             recordingRequested = false
@@ -839,6 +885,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         guard !awaitingFrames, selectedID != nil || selectedNetworkModule != nil else { return }
+        recordingSessionStartedUptime = nil
+        recordingSessionElapsed = 0
+        recordingTime.stringValue = recordingElapsedText
         recordingRequested = true
         do { try startNextRecording() }
         catch { recordingRequested = false; showRecordingError(error.localizedDescription) }
@@ -850,6 +899,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func stopCurrentRecording() {
+        if !recordingRequested { freezeRecordingClock() }
         recordingFinishing = true
         updateRecordingControls()
         if selectedNetworkModule != nil { networkRecorder.stop() }
@@ -887,7 +937,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.recordingSourceName = self.picker.titleOfSelectedItem ?? "摄像头"
             self.recordingDate = Date()
             self.recordingBusy = true
-            self.recordingTime.stringValue = "准备录制…"
+            if self.recordingSessionStartedUptime == nil && self.recordingSessionElapsed == 0 { self.recordingTime.stringValue = "准备录制…" }
             self.updateRecordingControls()
             if self.selectedNetworkModule != nil { self.networkRecorder.start(to: target, mirrored: self.mirror.state == .on) }
             else if let audio = self.audioDevice { self.camera.startRecording(to: target, audioDevice: audio, mirrored: self.mirror.state == .on) }
@@ -902,18 +952,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             recordingBusy = true
         case .recording:
             recordingStarted = Date()
+            if recordingRequested && recordingSessionStartedUptime == nil { recordingSessionStartedUptime = ProcessInfo.processInfo.systemUptime }
+            recordingTime.stringValue = recordingElapsedText
             recordingTime.textColor = .systemRed
         case .finishing:
             recordingFinishing = true
             recordingStarted = nil
-            recordingTime.stringValue = "正在保存…"
+            if !recordingRequested { freezeRecordingClock() }
         case .finished(let url, let error):
             recordingBusy = false
             recordingPreparing = false
             recordingFinishing = false
             recordingStarted = nil
-            recordingTime.textColor = .secondaryLabelColor
-            recordingTime.stringValue = url == nil ? "保存失败" : "已保存"
             var completionError = error
             if let url {
                 lastRecording = url
@@ -925,11 +975,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if rotatingRecording && recordingRequested && !pendingTermination && completionError == nil {
                 rotatingRecording = false
                 do { try startNextRecording() }
-                catch { recordingRequested = false; showRecordingError(error.localizedDescription) }
+                catch {
+                    recordingRequested = false
+                    freezeRecordingClock()
+                    showRecordingError(error.localizedDescription)
+                    updateRecordingControls()
+                }
                 return
             }
             rotatingRecording = false
             recordingRequested = false
+            freezeRecordingClock()
+            recordingTime.textColor = .secondaryLabelColor
+            recordingTime.stringValue = recordingElapsedText + (url == nil ? " · 保存失败" : " · 已保存")
             lastRecordingError = completionError
             if pendingTermination {
                 if recordingTestDirectory != nil { writeRecordingTestResult(error: completionError) }
@@ -1230,12 +1288,58 @@ extension AppDelegate {
         let expectsPeople = !CommandLine.arguments.contains("--expect-no-people")
         let verifyPeople = !CommandLine.arguments.contains("--allow-any-scene")
         let expectsAudioInterruption = CommandLine.arguments.contains("--expect-audio-interruption")
+        let verifyClock = CommandLine.arguments.contains("--verify-recording-clock")
+        let verifyControls = CommandLine.arguments.contains("--verify-playback-controls")
         let started = Date()
         var phase = 0
         var checks: [[String: Any]] = []
+        var clockSamples: [[String: Any]] = []
+        var previousClock = -1
+        var clockMonotonic = true
+        var initialWallClock = ""
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
+        func control(_ identifier: String) -> NSView? { descendants(playback).first { $0.accessibilityIdentifier() == identifier } }
+        func wallClock() -> NSTextField? { descendants(preview).compactMap { $0 as? NSTextField }.first { $0.accessibilityLabel() == "当前时间" } }
+        func elapsed() -> Int? {
+            let text = self.recordingTime.stringValue.components(separatedBy: " · ").first ?? ""
+            let parts = text.split(separator: ":").compactMap { Int($0) }
+            guard parts.count == 3 else { return nil }
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        }
         func check(_ name: String, _ passed: Bool) { checks.append(["name": name, "passed": passed]) }
+        func checkPlaybackControls() {
+            guard verifyControls else { return }
+            let video = descendants(self.playback).compactMap { $0 as? AVPlayerView }.first
+            check("no_system_floating_controls", video.map { $0.controlsStyle == .none } == true)
+            let identifiers = ["playback-play-pause", "playback-progress", "playback-volume", "playback-mute", "playback-speed", "playback-fullscreen"]
+            let bottom = video.map { $0.convert($0.bounds, to: self.playback).minY } ?? -1
+            check("playback_controls_fixed_below_video", identifiers.allSatisfy { id in
+                guard let view = control(id), !view.isHiddenOrHasHiddenAncestor else { return false }
+                return view.convert(view.bounds, to: self.playback).maxY <= bottom + 1
+            })
+            if let button = control("playback-play-pause") as? NSButton {
+                button.performClick(nil)
+                check("bottom_pause_control", self.playback.player.rate == 0)
+                button.performClick(nil)
+                check("bottom_play_control", self.playback.player.rate > 0)
+            }
+            if let speed = control("playback-speed") as? NSPopUpButton {
+                speed.selectItem(withTitle: "2×")
+                speed.sendAction(speed.action, to: speed.target)
+                check("bottom_speed_control", self.playback.player.rate == 2)
+            }
+            if let mute = control("playback-mute") as? NSButton {
+                mute.performClick(nil)
+                check("bottom_mute_control", self.playback.player.isMuted)
+            }
+            if let volume = control("playback-volume") as? NSSlider {
+                volume.doubleValue = 0.3
+                volume.sendAction(volume.action, to: volume.target)
+                check("bottom_volume_control", abs(self.playback.player.volume - 0.3) < 0.01 && !self.playback.player.isMuted)
+            }
+        }
         func finish(_ error: String? = nil) {
-            let report: [String: Any] = ["passed": error == nil && checks.allSatisfy { $0["passed"] as? Bool == true }, "error": error ?? "", "checks": checks]
+            let report: [String: Any] = ["passed": error == nil && checks.allSatisfy { $0["passed"] as? Bool == true }, "error": error ?? "", "checks": checks, "clockSamples": clockSamples]
             try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]).write(to: directory.appendingPathComponent(restoring ? "restore-result.json" : "record-result.json"))
             NSApp.terminate(nil)
         }
@@ -1249,6 +1353,7 @@ extension AppDelegate {
             playback.selectFirstRecording()
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
                 check("restored_video_playable", self.playback.player.currentItem?.status == .readyToPlay)
+                checkPlaybackControls()
                 self.saveExperienceScreenshot(directory.appendingPathComponent("restored.png"))
                 finish()
             }
@@ -1259,6 +1364,12 @@ extension AppDelegate {
         let deviceID = deviceIndex.map { CommandLine.arguments[$0 + 1] } ?? "fixture-manual-device"
         beginModuleConnection(CameraModuleIdentity(deviceID: deviceID, salt: "", address: CommandLine.arguments[addressIndex + 1]))
         let testTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { timer in
+            if verifyClock && (phase == 1 || phase == 2) {
+                if let value = elapsed() {
+                    if value < previousClock { clockMonotonic = false }
+                    if value != previousClock { clockSamples.append(["phase": phase, "elapsed": value, "display": self.recordingTime.stringValue]); previousClock = value }
+                } else if phase == 2 { clockMonotonic = false }
+            }
             if expectsAudioInterruption && Date().timeIntervalSince(started) > 12 && self.lastRecordingError == nil {
                 self.recordingRequested = false
                 self.stopCurrentRecording()
@@ -1282,6 +1393,11 @@ extension AppDelegate {
             case 0:
                 guard !self.awaitingFrames, self.recordButton.isEnabled, Date().timeIntervalSince(self.lastNetworkAudioAt) < 2 else { return }
                 check("wifi_recording_enabled", true)
+                if verifyClock {
+                    let clock = wallClock()
+                    initialWallClock = clock?.stringValue ?? ""
+                    check("live_wall_clock_visible", clock != nil && clock?.isHiddenOrHasHiddenAncestor == false && initialWallClock.range(of: "^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}$", options: .regularExpression) != nil)
+                }
                 check("no_audio_choice", !self.window.contentView!.subviews.contains { ($0 as? NSButton)?.title == "录入声音" })
                 self.recordButton.performClick(nil)
                 phase = 1
@@ -1291,14 +1407,31 @@ extension AppDelegate {
                 self.modePicker.selectedSegment = 1
                 self.modePicker.sendAction(self.modePicker.action, to: self.modePicker.target)
                 check("playback_while_recording", self.recordingBusy && !self.playback.isHidden && self.preview.isHidden)
+                if verifyClock { check("live_wall_clock_hidden_in_playback", wallClock()?.isHiddenOrHasHiddenAncestor == true) }
                 phase = 2
             case 2:
                 guard self.savedRecordings >= 1, let date = self.recordingStarted, Date().timeIntervalSince(date) > 3 else { return }
                 check("automatic_segment_saved", !self.library.entries.isEmpty)
+                if verifyClock {
+                    check("recording_time_accumulates_across_segments", (elapsed() ?? -1) >= 6)
+                    check("recording_time_does_not_reset_during_save", clockMonotonic)
+                    check("live_wall_clock_updates", wallClock() != nil && wallClock()?.stringValue != initialWallClock)
+                }
                 self.recordButton.performClick(nil)
                 phase = 3
+            case 4:
+                guard let date = self.recordingStarted, Date().timeIntervalSince(date) >= 2.6 else { return }
+                check("new_recording_session_starts_from_zero", (elapsed() ?? 100) <= 3)
+                self.recordButton.performClick(nil)
+                phase = 5
             default:
                 guard !self.recordingBusy, self.savedRecordings >= 2, self.library.entries.allSatisfy({ $0.indexState == "ready" }) else { return }
+                if verifyClock && phase == 3 {
+                    check("stopped_recording_keeps_total_time", (elapsed() ?? -1) >= 6)
+                    self.recordButton.performClick(nil)
+                    phase = 4
+                    return
+                }
                 check("recordings_visible_in_playback", self.playback.visibleRecordingCount == self.library.entries.count)
                 if verifyPeople { check("human_detection_matches_scene", self.library.entries.contains { !$0.events.isEmpty } == expectsPeople) }
                 self.playback.selectFirstRecording()
@@ -1307,6 +1440,7 @@ extension AppDelegate {
                 timer.invalidate()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
                     check("video_playable", self.playback.player.currentItem?.status == .readyToPlay)
+                    checkPlaybackControls()
                     if expectsPeople && verifyPeople { check("event_button_seek", self.playback.performFirstEventJump()) }
                     self.modePicker.selectedSegment = 0
                     self.modePicker.sendAction(self.modePicker.action, to: self.modePicker.target)

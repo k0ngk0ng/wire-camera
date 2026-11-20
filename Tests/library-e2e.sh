@@ -14,7 +14,7 @@ xcrun swiftc -swift-version 5 -module-cache-path "$CLANG_MODULE_CACHE_PATH" \
 INTERFACE_NAME="$(route -n get default | awk '$1 == "interface:" {print $2}')"
 FIXTURE_ADDRESS="$(ipconfig getifaddr "$INTERFACE_NAME")"
 SCENE="${WIRECAMERA_E2E_SCENE:-person}"
-SCENE_ARGUMENTS=()
+SCENE_ARGUMENTS=(--verify-recording-clock --verify-playback-controls)
 SCENE_FRAME="$PWD/Tests/Fixtures/person-frame.jpg"
 if [[ "$SCENE" == empty ]]; then
   SCENE_FRAME="$PWD/Tests/Fixtures/module-jpeg-frame.jpg"
