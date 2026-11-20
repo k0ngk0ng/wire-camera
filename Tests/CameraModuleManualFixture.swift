@@ -36,12 +36,13 @@ struct CameraModuleManualFixture {
         }
     }
 
-    static func serve(_ descriptor: Int32, jpeg: Data) {
+    static func serve(_ descriptor: Int32, jpeg: Data, audio: Bool) {
         defer { close(descriptor) }
         var enabled: Int32 = 1
         setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled, socklen_t(MemoryLayout<Int32>.size))
         var assembler = CameraModuleStreamAssembler()
         var playing = false
+        var audioPlaying = false
         var sequence: UInt64 = 1
         let deadline = Date().addingTimeInterval(90)
         var nextFrame = Date()
@@ -64,6 +65,9 @@ struct CameraModuleManualFixture {
                             guard frame.body.isEmpty else { return }
                             playing = true
                             body = Data()
+                        case 2614:
+                            audioPlaying = audio
+                            body = audio ? Data([0x28, 21, 0x30, 0xc0, 0x3e, 0x38, 16, 0x40, 1]) : Data([8, 1])
                         case 107: body = Data()
                         default: return
                         }
@@ -78,8 +82,17 @@ struct CameraModuleManualFixture {
                     body.append(jpeg)
                     let packet = Data([0x68]) + Data(CameraModuleNetworkProtocol.varint(UInt64(body.count))) + body
                     try sendAll(packet, to: descriptor)
+                    if audioPlaying && (!CommandLine.arguments.contains("--audio-drop") || sequence < 12) {
+                        var audioBody = Data([21, 0, 0])
+                        audioBody.append(contentsOf: CameraModuleNetworkProtocol.varint(sequence))
+                        audioBody.append(contentsOf: CameraModuleNetworkProtocol.varint(UInt64(Date().timeIntervalSince1970 * 1000)))
+                        audioBody.append(0)
+                        let tone: [UInt8] = [0xd5, 0x87, 0x96, 0xba, 0x9a, 0x85, 0xe3, 0x60, 0x04, 0x1b, 0x3a, 0x16, 0x07, 0x55, 0xd5, 0xd5]
+                        audioBody.append(contentsOf: (0..<800).map { tone[$0 % tone.count] })
+                        try sendAll(Data([0x68]) + Data(CameraModuleNetworkProtocol.varint(UInt64(audioBody.count))) + audioBody, to: descriptor)
+                    }
                     sequence += 1
-                    nextFrame = Date().addingTimeInterval(0.1)
+                    nextFrame = nextFrame.addingTimeInterval(0.1)
                 }
             }
         } catch { return }
@@ -117,7 +130,7 @@ struct CameraModuleManualFixture {
             }
             if events[1].revents & Int16(POLLIN) != 0 {
                 let connection = accept(tcp, nil, nil)
-                if connection >= 0 { connections += 1; DispatchQueue.global().async { serve(connection, jpeg: jpeg) } }
+                if connection >= 0 { connections += 1; DispatchQueue.global().async { serve(connection, jpeg: jpeg, audio: CommandLine.arguments.contains("--audio")) } }
             }
             let report: [String: Any] = ["scope": "synthetic_module_on_direct_ip", "realModuleVerified": false, "requests": requests, "connections": connections]
             try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]).write(to: directory.appendingPathComponent("server.json"), options: .atomic)

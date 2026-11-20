@@ -21,7 +21,7 @@ directory = pathlib.Path(sys.argv[1])
 application = json.loads((directory / 'app-result.json').read_text())
 assert application['passed'], application
 results = []
-for name, expected_audio in [('silent.mov', False), ('sound.mov', True), ('quit.mov', True)]:
+for name, expected_audio in [('first.mov', True), ('sound.mov', True), ('quit.mov', True)]:
     movie = directory / name
     probe = subprocess.run(['ffprobe', '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(movie)], capture_output=True, text=True, check=True)
     metadata = json.loads(probe.stdout)

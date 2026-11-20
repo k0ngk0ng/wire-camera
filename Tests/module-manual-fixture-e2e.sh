@@ -10,7 +10,7 @@ export WIRECAMERA_MODULE_ADDRESS="$(ipconfig getifaddr "$INTERFACE_NAME")"
 export WIRECAMERA_MODULE_STORE="$RUN_DIR/modules.json"
 xcrun swiftc -swift-version 5 -module-cache-path "$CLANG_MODULE_CACHE_PATH" \
   -framework CoreMedia -framework VideoToolbox \
-  Sources/CameraModuleProtocol.swift Sources/CameraModuleNetwork.swift Sources/CameraModuleVideoSampler.swift Tests/CameraModuleManualFixture.swift \
+  Sources/CameraModuleProtocol.swift Sources/CameraModuleNetwork.swift Sources/CameraModuleVideoSampler.swift Sources/CameraModuleAudioSampler.swift Tests/CameraModuleManualFixture.swift \
   -o "$RUN_DIR/fixture"
 "$RUN_DIR/fixture" "$WIRECAMERA_MODULE_ADDRESS" "$RUN_DIR" "$PWD/Tests/Fixtures/module-jpeg-frame.jpg" > "$RUN_DIR/fixture.log" 2>&1 &
 FIXTURE_PID=$!

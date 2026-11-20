@@ -254,6 +254,8 @@ enum CameraModuleNetworkProtocol {
 
 final class CameraModuleNetwork {
     var onSampleBuffer: ((CMSampleBuffer) -> Void)?
+    var onAudioSampleBuffer: ((CMSampleBuffer) -> Void)?
+    var onAudioError: ((String) -> Void)?
     var onFrame: ((Int32, Int32, Double) -> Void)?
     var onError: ((String) -> Void)?
     private struct Interface {
@@ -476,17 +478,21 @@ final class CameraModuleNetwork {
         }
         let deadline = Date().addingTimeInterval(max(1, min(timeout, 45)))
         var nextSend = Date.distantPast
+        var sendBinary = true
         var targetResponseError: Error?
         var discovered: Set<String> = []
         while current(request), Date() < deadline {
             if Date() >= nextSend {
+                let outgoing = sendBinary ? binaryPacket : packet
+                sendBinary.toggle()
                 for destinationValue in destinations {
                     var destination = address(destinationValue, port: 20190)
-                    for outgoing in [packet, binaryPacket] {
+                    do {
                         outgoing.withUnsafeBytes { bytes in
                             withUnsafePointer(to: &destination) { pointer in
                                 pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                                    _ = sendto(descriptor, bytes.baseAddress, outgoing.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                                    let sent = sendto(descriptor, bytes.baseAddress, outgoing.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                                    if sent < 0 { NSLog("Module discovery send failed: errno=%d", errno) }
                                 }
                             }
                         }
@@ -667,6 +673,16 @@ final class CameraModuleNetwork {
         var assembler = CameraModuleStreamAssembler()
         var frameAssembler = CameraModuleVideoFrameAssembler()
         let sampler = CameraModuleVideoSampler()
+        var audioSampler: CameraModuleAudioSampler?
+        var audioRequested = false
+        var audioFailureReported = false
+        func reportAudioFailure(_ message: String) {
+            guard !audioFailureReported else { return }
+            audioFailureReported = true
+            DispatchQueue.main.async {
+                if self.current(request) { self.onAudioError?(message) }
+            }
+        }
         var nextHeartbeat = Date().addingTimeInterval(1)
         var heartbeatSequence: UInt64 = 10
         var acknowledgedSequence: UInt64 = 0
@@ -700,18 +716,36 @@ final class CameraModuleNetwork {
                 if packet[0] == 0x48 {
                     let response = try CameraModuleNetworkProtocol.decode(packet)
                     if try answer(response, descriptor: descriptor, request: request) { continue }
+                    if response.command == CameraModuleAudioSampler.playCommand, response.rpc == 1 {
+                        do {
+                            guard response.status == 0 else { throw moduleNetworkFailure("摄像头模块未能开启声音。") }
+                            audioSampler = CameraModuleAudioSampler(format: try CameraModuleAudioFormat(response: response.body))
+                        } catch { reportAudioFailure(error.localizedDescription) }
+                        continue
+                    }
                     guard response.status == 0 else { throw moduleNetworkFailure("摄像头模块拒绝了视频命令（状态 \(response.status)）。") }
                     continue
                 }
                 let fragment = try CameraModuleVideoProtocol.decode(packet, sessionKey: sessionKey)
                 acknowledgedSequence = max(acknowledgedSequence, fragment.sequence)
-                guard fragment.format <= 20, fragment.source != 2, let frame = try frameAssembler.append(fragment) else { continue }
+                guard fragment.source != 2, let frame = try frameAssembler.append(fragment) else { continue }
                 let key = (frame.channel << 8) | UInt64(frame.format)
                 if let previous = previousSequences[key], frame.sequence <= previous { continue }
                 previousSequences[key] = frame.sequence
+                if frame.format > 20 {
+                    guard let audioSampler else { continue }
+                    do {
+                        if let sample = try audioSampler.sample(frame), current(request) { onAudioSampleBuffer?(sample) }
+                    } catch { reportAudioFailure(error.localizedDescription) }
+                    continue
+                }
                 guard let sample = try sampler.imageSample(frame), let format = CMSampleBufferGetFormatDescription(sample) else { continue }
                 guard current(request) else { return }
                 onSampleBuffer?(sample)
+                if !audioRequested {
+                    audioRequested = true
+                    try write(CameraModuleNetworkProtocol.encode(command: CameraModuleAudioSampler.playCommand, sequence: 4, body: CameraModuleAudioSampler.playBody()), descriptor: descriptor, request: request)
+                }
                 if lastReport == nil {
                     let dimensions = CMVideoFormatDescriptionGetDimensions(format)
                     NSLog("Module video decoded: %d x %d", dimensions.width, dimensions.height)

@@ -163,12 +163,10 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
         }
     }
 
-    private func configureRecordedAudio(enabled: Bool) throws {
+    private func configureRecordedAudio() throws {
         session.beginConfiguration()
         defer { session.commitConfiguration() }
-        if !enabled {
-            if let connection = movie.connection(with: .audio) { session.removeConnection(connection) }
-        } else if movie.connection(with: .audio) == nil {
+        if movie.connection(with: .audio) == nil {
             guard let input = audioInput else { throw failure("摄像头声音未连接。") }
             let ports = input.ports.filter { $0.mediaType == .audio }
             guard !ports.isEmpty else { throw failure("摄像头没有可录制的声音端口。") }
@@ -178,7 +176,7 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
         }
     }
 
-    func startRecording(to target: URL, audioDevice: AVCaptureDevice?, mirrored: Bool) {
+    func startRecording(to target: URL, audioDevice: AVCaptureDevice, mirrored: Bool) {
         queue.async {
             guard self.destination == nil else { return }
             self.publish(.starting)
@@ -190,8 +188,8 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
                     throw self.failure("保存目标是文件夹，请选择 MOV 文件。")
                 }
                 guard FileManager.default.isWritableFile(atPath: parent.path) else { throw self.failure("保存位置不可写，请选择其他文件夹。") }
-                try self.configureAudio(audioDevice ?? (self.monitoring ? self.audioInput?.device : nil))
-                try self.configureRecordedAudio(enabled: audioDevice != nil)
+                try self.configureAudio(audioDevice)
+                try self.configureRecordedAudio()
                 try self.applyVideoFormat()
                 guard let connection = self.movie.connection(with: .video), connection.isActive else {
                     throw self.failure("摄像头没有可录制的视频连接。")
