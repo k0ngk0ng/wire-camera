@@ -95,6 +95,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let playback = CameraPlaybackView(frame: .zero)
     private let liveTools = NSStackView()
     private var libraryTestDirectory: URL?
+    private var automaticRecordingDeviceID: String?
     private lazy var library: CameraRecordingLibrary = {
         let arguments = CommandLine.arguments
         if let index = arguments.firstIndex(of: "--recordings-path"), arguments.indices.contains(index + 1) {
@@ -112,6 +113,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let preview = PreviewView(frame: .zero)
     private let picker = NSPopUpButton(frame: .zero, pullsDown: false)
     private let picturePicker = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let playbackPicker = NSPopUpButton(frame: .zero, pullsDown: false)
+    private var playbackSources: [(id: String, name: String)] = []
+    private var selectedPlaybackSourceID: String?
+    private var playbackSourceChosen = false
+    private let recordingTarget = NSTextField(labelWithString: "")
     private var pictureModes: [CameraPictureMode] = []
     private var selectedPictureMode: CameraPictureMode?
     private var latestVideoWidth: Int32 = 0
@@ -189,6 +195,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("WireCamera launched; camera permission=%ld audio permission=%ld", AVCaptureDevice.authorizationStatus(for: .video).rawValue, AVCaptureDevice.authorizationStatus(for: .audio).rawValue)
+        if let index = CommandLine.arguments.firstIndex(of: "--record-camera"), CommandLine.arguments.indices.contains(index + 1) {
+            automaticRecordingDeviceID = CommandLine.arguments[index + 1]
+        }
         buildMenu()
         buildWindow()
         camera.onRecording = { [weak self] event in self?.recordingChanged(event) }
@@ -262,6 +271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let wasDisconnected = Date().timeIntervalSince(self.lastNetworkAudioAt) > 3
                 self.lastNetworkAudioAt = Date()
                 if wasDisconnected { self.updateRecordingControls() }
+                self.startAutomaticRecordingIfReady()
             }
         }
         moduleNetwork.onAudioError = { [weak self] message in
@@ -310,8 +320,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        if !savedModuleTesting && libraryTestDirectory == nil && !CommandLine.arguments.contains("--disable-module-scan") { moduleScanner.scanNearby(onDevice: { [weak self] device in self?.registerNearbyModule(device) }, completion: { _ in }) }
-        if libraryTestDirectory == nil && moduleTestDirectory == nil && modulePreviewTestDirectory == nil && !CommandLine.arguments.contains("--add-camera") { requestCamera() }
+        if automaticRecordingDeviceID == nil && !savedModuleTesting && libraryTestDirectory == nil && !CommandLine.arguments.contains("--disable-module-scan") { moduleScanner.scanNearby(onDevice: { [weak self] device in self?.registerNearbyModule(device) }, completion: { _ in }) }
+        if automaticRecordingDeviceID == nil && libraryTestDirectory == nil && moduleTestDirectory == nil && modulePreviewTestDirectory == nil && !CommandLine.arguments.contains("--add-camera") { requestCamera() }
         recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.liveClock.stringValue = self.liveClockFormatter.string(from: Date())
@@ -323,13 +333,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self.stopCurrentRecording()
             }
         }
+        if let deviceID = automaticRecordingDeviceID {
+            let address = moduleStore.devices.first(where: { $0.deviceID == deviceID })?.address
+            beginModuleConnection(CameraModuleIdentity(deviceID: deviceID, salt: "", address: address))
+        }
+        if let index = CommandLine.arguments.firstIndex(of: "--automatic-recording-e2e"), CommandLine.arguments.indices.contains(index + 1) {
+            runAutomaticRecordingE2E(directory: URL(fileURLWithPath: CommandLine.arguments[index + 1]))
+        }
         if libraryTestDirectory != nil { runLibraryE2E() }
         if recordingTestDirectory != nil { runRecordingE2E() }
         if pictureTestDirectory != nil { runPictureModeE2E() }
         if let directory = moduleTestDirectory {
             addModule.performClick(nil)
             moduleConnection?.runE2E(to: directory)
-        } else if CommandLine.arguments.contains("--add-camera") {
+        } else if automaticRecordingDeviceID == nil && CommandLine.arguments.contains("--add-camera") {
             addModule.performClick(nil)
         }
         if modulePreviewTestDirectory != nil {
@@ -403,11 +420,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         picker.action = #selector(selectCamera)
         picker.setAccessibilityLabel("摄像头")
         picker.lineBreakMode = .byTruncatingMiddle
+        playbackPicker.target = self
+        playbackPicker.action = #selector(selectPlaybackCamera)
+        playbackPicker.setAccessibilityLabel("回放摄像头")
+        playbackPicker.setAccessibilityIdentifier("playback-camera")
+        playbackPicker.lineBreakMode = .byTruncatingMiddle
+        playbackPicker.isHidden = true
         addModule.target = self
         addModule.action = #selector(showModuleConnection)
         addModule.bezelStyle = .rounded
         addModule.image = NSImage(systemSymbolName: "plus", accessibilityDescription: nil)
-        let devices = NSStackView(views: [picker, addModule])
+        let devices = NSStackView(views: [picker, playbackPicker, addModule])
+        devices.detachesHiddenViews = true
         devices.spacing = 12
         for view in [title, modePicker, devices] { view.translatesAutoresizingMaskIntoConstraints = false; header.addSubview(view) }
         picturePicker.target = self
@@ -441,7 +465,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         revealButton.target = self
         revealButton.action = #selector(revealRecording)
         revealButton.bezelStyle = .rounded
-        let recordControls = NSStackView(views: [recordButton, recordingTime])
+        recordingTarget.font = .systemFont(ofSize: 11)
+        recordingTarget.textColor = .secondaryLabelColor
+        recordingTarget.lineBreakMode = .byTruncatingMiddle
+        recordingTarget.isHidden = true
+        let recordControls = NSStackView(views: [recordButton, recordingTime, recordingTarget])
         recordControls.spacing = 16
         for view in [recordControls, revealButton] { view.translatesAutoresizingMaskIntoConstraints = false; recordingBar.addSubview(view) }
         status.font = .systemFont(ofSize: 12, weight: .medium)
@@ -490,7 +518,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             header.topAnchor.constraint(equalTo: root.topAnchor), header.leadingAnchor.constraint(equalTo: root.leadingAnchor), header.trailingAnchor.constraint(equalTo: root.trailingAnchor), header.heightAnchor.constraint(equalToConstant: 72),
             title.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 24), title.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             modePicker.leadingAnchor.constraint(equalTo: title.trailingAnchor, constant: 36), modePicker.centerYAnchor.constraint(equalTo: header.centerYAnchor),
-            devices.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -24), devices.centerYAnchor.constraint(equalTo: header.centerYAnchor), devices.leadingAnchor.constraint(greaterThanOrEqualTo: modePicker.trailingAnchor, constant: 24), picker.widthAnchor.constraint(equalToConstant: 270),
+            devices.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -24), devices.centerYAnchor.constraint(equalTo: header.centerYAnchor), devices.leadingAnchor.constraint(greaterThanOrEqualTo: modePicker.trailingAnchor, constant: 24), picker.widthAnchor.constraint(equalToConstant: 270), playbackPicker.widthAnchor.constraint(equalToConstant: 270), recordingTarget.widthAnchor.constraint(lessThanOrEqualToConstant: 240),
             liveTools.topAnchor.constraint(equalTo: header.bottomAnchor), liveTools.leadingAnchor.constraint(equalTo: root.leadingAnchor), liveTools.trailingAnchor.constraint(equalTo: root.trailingAnchor), liveTools.heightAnchor.constraint(equalToConstant: 48), picturePicker.widthAnchor.constraint(equalToConstant: 190), volume.widthAnchor.constraint(equalToConstant: 90),
             preview.topAnchor.constraint(equalTo: liveTools.bottomAnchor), preview.leadingAnchor.constraint(equalTo: root.leadingAnchor), preview.trailingAnchor.constraint(equalTo: root.trailingAnchor), preview.bottomAnchor.constraint(equalTo: recordingBar.topAnchor),
             playback.topAnchor.constraint(equalTo: header.bottomAnchor), playback.leadingAnchor.constraint(equalTo: root.leadingAnchor), playback.trailingAnchor.constraint(equalTo: root.trailingAnchor), playback.bottomAnchor.constraint(equalTo: recordingBar.topAnchor),
@@ -513,9 +541,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         refreshPlayback()
     }
 
+    private var liveSourceID: String? {
+        selectedNetworkModule.map { "wifi:" + $0.deviceID } ?? selectedID.map { "usb:" + $0 }
+    }
+
     private func refreshPlayback() {
-        let source = selectedNetworkModule.map { "wifi:" + $0.deviceID } ?? selectedID.map { "usb:" + $0 }
-        playback.update(library: library, sourceID: source, recordingActive: recordingBusy || recordingPreparing)
+        var seen: Set<String> = []
+        playbackSources = library.entries.compactMap { entry in
+            guard seen.insert(entry.sourceID).inserted else { return nil }
+            return (id: entry.sourceID, name: entry.sourceName.isEmpty ? entry.sourceID : entry.sourceName)
+        }
+        if let source = liveSourceID, !seen.contains(source) {
+            playbackSources.append((id: source, name: picker.titleOfSelectedItem ?? "摄像头"))
+        }
+        playbackSources.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        if !playbackSourceChosen || !playbackSources.contains(where: { $0.id == selectedPlaybackSourceID }) {
+            selectedPlaybackSourceID = playbackSources.contains(where: { $0.id == liveSourceID }) ? liveSourceID : library.entries.first?.sourceID ?? playbackSources.first?.id
+        }
+        playbackPicker.removeAllItems()
+        for source in playbackSources {
+            let sameName = playbackSources.filter { $0.name == source.name }.count > 1
+            playbackPicker.addItem(withTitle: sameName ? source.name + " · " + source.id.suffix(6) : source.name)
+            playbackPicker.lastItem?.representedObject = source.id
+        }
+        if let index = playbackSources.firstIndex(where: { $0.id == selectedPlaybackSourceID }) { playbackPicker.selectItem(at: index) }
+        if playbackSources.isEmpty { playbackPicker.addItem(withTitle: "暂无录像的摄像头") }
+        let currentRecording = selectedPlaybackSourceID == liveSourceID && (recordingBusy || recordingPreparing)
+        playback.update(library: library, sourceID: selectedPlaybackSourceID, recordingActive: currentRecording)
+        updateRecordingControls()
+    }
+
+    @objc private func selectPlaybackCamera() {
+        guard playbackSources.indices.contains(playbackPicker.indexOfSelectedItem) else { return }
+        selectedPlaybackSourceID = playbackSources[playbackPicker.indexOfSelectedItem].id
+        playbackSourceChosen = true
+        refreshPlayback()
     }
 
     private func requestCamera() {
@@ -763,6 +823,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         status.textColor = NSColor(calibratedRed: 0.38, green: 0.86, blue: 0.68, alpha: 1)
         detail.stringValue = "\(width) × \(height)" + (fps > 0 ? "  ·  \(Int(fps.rounded())) fps" : "") + "  ·  局域网预览"
         updateRecordingControls()
+        startAutomaticRecordingIfReady()
     }
     @objc private func toggleFullscreen() { window.toggleFullScreen(nil) }
     @objc private func openSettings() {
@@ -798,6 +859,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func updateRecordingControls() {
         let locked = recordingBusy || recordingPreparing
+        let isPlayback = modePicker.selectedSegment == 1
+        picker.isHidden = isPlayback
+        playbackPicker.isHidden = !isPlayback
+        playbackPicker.isEnabled = !playbackSources.isEmpty
+        addModule.isHidden = isPlayback
+        recordingTarget.stringValue = "录制：" + recordingSourceName
+        recordingTarget.isHidden = !isPlayback || !recordingBusy || selectedPlaybackSourceID == recordingSourceID
         picker.isEnabled = !locked && (!devices.isEmpty || !networkModules.isEmpty)
         picturePicker.isEnabled = !locked && !audioChanging && selectedID != nil && pictureModes.count > 1
         mirror.isEnabled = !locked
@@ -806,9 +874,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         listen.isEnabled = !locked && audioDevice != nil && !audioChanging
         volume.isEnabled = listen.state == .on
         let soundReady = selectedNetworkModule != nil ? Date().timeIntervalSince(lastNetworkAudioAt) < 3 : audioDevice != nil
-        recordButton.isEnabled = !recordingPreparing && !recordingFinishing && !audioChanging && (recordingBusy || ((selectedID != nil || selectedNetworkModule != nil) && !awaitingFrames && soundReady))
+        recordButton.isEnabled = !recordingPreparing && !recordingFinishing && !audioChanging && (recordingBusy || ((selectedID != nil || selectedNetworkModule != nil) && !awaitingFrames && soundReady && (!isPlayback || selectedPlaybackSourceID == liveSourceID)))
         recordButton.title = recordingFinishing ? "正在保存…" : (recordingBusy ? "停止录制" : "开始录制")
-        if !soundReady && !locked && !awaitingFrames {
+        if liveSourceID != nil && !soundReady && !locked && !awaitingFrames {
             recordButton.title = selectedNetworkModule == nil ? "摄像头声音未连接" : "正在连接声音…"
         }
         revealButton.isEnabled = !library.entries.isEmpty
@@ -861,6 +929,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func changeVolume() { camera.setVolume(Float(volume.doubleValue)) }
+
+    private func startAutomaticRecordingIfReady() {
+        guard let deviceID = automaticRecordingDeviceID, selectedNetworkModule?.deviceID == deviceID,
+              !awaitingFrames, Date().timeIntervalSince(lastNetworkAudioAt) < 3,
+              !recordingBusy, !recordingPreparing else { return }
+        automaticRecordingDeviceID = nil
+        toggleRecording()
+        NSLog("Automatic Wi-Fi recording started")
+    }
 
     private var recordingElapsedSeconds: TimeInterval {
         recordingSessionStartedUptime.map { max(0, ProcessInfo.processInfo.systemUptime - $0) } ?? recordingSessionElapsed
@@ -1266,7 +1343,7 @@ if CommandLine.arguments.contains("--diagnose") {
     }
     print("Discovered \(cameras.count) camera(s).")
 } else {
-    if !CommandLine.arguments.contains("--check-ui"), !CommandLine.arguments.contains("--library-e2e"),
+    if !CommandLine.arguments.contains("--check-ui"), !CommandLine.arguments.contains("--library-e2e"), !CommandLine.arguments.contains("--automatic-recording-e2e"),
        let identifier = Bundle.main.bundleIdentifier,
        let existing = NSRunningApplication.runningApplications(withBundleIdentifier: identifier).first(where: {
            $0.processIdentifier != ProcessInfo.processInfo.processIdentifier && !$0.isTerminated
@@ -1290,6 +1367,11 @@ extension AppDelegate {
         let expectsAudioInterruption = CommandLine.arguments.contains("--expect-audio-interruption")
         let verifyClock = CommandLine.arguments.contains("--verify-recording-clock")
         let verifyControls = CommandLine.arguments.contains("--verify-playback-controls")
+        let verifyOffline = CommandLine.arguments.contains("--verify-offline-playback")
+        let offlineSourceID = "wifi:fixture-offline-archive"
+        let offlineSourceName = "Wi-Fi · 离线摄像头"
+        var offlineChecked = false
+        var offlinePending = false
         let started = Date()
         var phase = 0
         var checks: [[String: Any]] = []
@@ -1299,6 +1381,23 @@ extension AppDelegate {
         var initialWallClock = ""
         func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
         func control(_ identifier: String) -> NSView? { descendants(playback).first { $0.accessibilityIdentifier() == identifier } }
+        func historyPicker() -> NSPopUpButton? {
+            guard let root = window.contentView else { return nil }
+            return descendants(root).compactMap { $0 as? NSPopUpButton }.first { $0.accessibilityIdentifier() == "playback-camera" }
+        }
+        func checkOfflineSelection() {
+            let picker = historyPicker()
+            check("offline_camera_available", picker?.itemTitles.contains(offlineSourceName) == true)
+            let networkID = self.selectedNetworkModule?.deviceID
+            let generation = self.generation
+            picker?.selectItem(withTitle: offlineSourceName)
+            if let picker { picker.sendAction(picker.action, to: picker.target) }
+            check("offline_camera_filter", self.playback.visibleRecordingCount == self.library.entries.filter { $0.sourceID == offlineSourceID }.count && self.playback.visibleRecordingCount == 1)
+            check("history_selection_does_not_reconnect", self.selectedNetworkModule?.deviceID == networkID && self.generation == generation)
+            self.playback.selectFirstRecording()
+            let url = (self.playback.player.currentItem?.asset as? AVURLAsset)?.url
+            check("offline_recording_selected", url?.lastPathComponent == self.library.entries.first(where: { $0.sourceID == offlineSourceID })?.filename)
+        }
         func wallClock() -> NSTextField? { descendants(preview).compactMap { $0 as? NSTextField }.first { $0.accessibilityLabel() == "当前时间" } }
         func elapsed() -> Int? {
             let text = self.recordingTime.stringValue.components(separatedBy: " · ").first ?? ""
@@ -1350,8 +1449,13 @@ extension AppDelegate {
             modePicker.selectedSegment = 1
             modePicker.sendAction(modePicker.action, to: modePicker.target)
             check("restored_playback_visible", !playback.isHidden)
-            playback.selectFirstRecording()
+            if verifyOffline { checkOfflineSelection() } else { playback.selectFirstRecording() }
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                if verifyOffline {
+                    check("offline_playback_without_connection", self.selectedNetworkModule == nil && self.selectedID == nil)
+                    check("offline_playback_has_no_connection_blocker", self.recordButton.title == "开始录制")
+                    check("offline_date_restored", self.playback.visibleRecordingCount == 1)
+                }
                 check("restored_video_playable", self.playback.player.currentItem?.status == .readyToPlay)
                 checkPlaybackControls()
                 self.saveExperienceScreenshot(directory.appendingPathComponent("restored.png"))
@@ -1410,6 +1514,39 @@ extension AppDelegate {
                 if verifyClock { check("live_wall_clock_hidden_in_playback", wallClock()?.isHiddenOrHasHiddenAncestor == true) }
                 phase = 2
             case 2:
+                if verifyOffline && !offlineChecked {
+                    guard !offlinePending, self.savedRecordings >= 1, let original = self.library.entries.first else { return }
+                    offlinePending = true
+                    do {
+                        let id = UUID().uuidString
+                        let entry = CameraRecording(id: id, sourceID: offlineSourceID, sourceName: offlineSourceName, startedAt: Calendar.current.date(byAdding: .day, value: -1, to: original.startedAt)!, duration: original.duration, events: original.events, indexState: "ready")
+                        try FileManager.default.copyItem(at: self.library.movieURL(original), to: self.library.movieURL(entry))
+                        try JSONEncoder().encode(entry).write(to: self.library.directory.appendingPathComponent(id + ".json"), options: .atomic)
+                        self.library.reload()
+                        let currentSource = self.recordingSourceID
+                        let savedBefore = self.savedRecordings
+                        let generation = self.generation
+                        check("history_picker_enabled_during_recording", historyPicker()?.isEnabled == true)
+                        checkOfflineSelection()
+                        self.saveExperienceScreenshot(directory.appendingPathComponent("offline-during-recording.png"))
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 4.2) {
+                            check("offline_video_playable", self.playback.player.currentItem?.status == .readyToPlay)
+                            check("background_recording_keeps_source", self.recordingRequested && self.recordingBusy && self.recordingSourceID == currentSource && self.generation == generation)
+                            check("background_segment_saved_during_offline_playback", self.savedRecordings > savedBefore)
+                            check("offline_selection_survives_new_segments", historyPicker()?.titleOfSelectedItem == offlineSourceName && self.playback.visibleRecordingCount == 1)
+                            if let picker = historyPicker(), let source = self.library.entries.first(where: { $0.sourceID == currentSource }) {
+                                picker.selectItem(withTitle: source.sourceName)
+                                picker.sendAction(picker.action, to: picker.target)
+                            }
+                            offlineChecked = true
+                            offlinePending = false
+                        }
+                    } catch {
+                        timer.invalidate()
+                        finish(error.localizedDescription)
+                    }
+                    return
+                }
                 guard self.savedRecordings >= 1, let date = self.recordingStarted, Date().timeIntervalSince(date) > 3 else { return }
                 check("automatic_segment_saved", !self.library.entries.isEmpty)
                 if verifyClock {
@@ -1432,7 +1569,7 @@ extension AppDelegate {
                     phase = 4
                     return
                 }
-                check("recordings_visible_in_playback", self.playback.visibleRecordingCount == self.library.entries.count)
+                check("recordings_visible_in_playback", self.playback.visibleRecordingCount == self.library.entries.filter { $0.sourceID == self.recordingSourceID }.count)
                 if verifyPeople { check("human_detection_matches_scene", self.library.entries.contains { !$0.events.isEmpty } == expectsPeople) }
                 self.playback.selectFirstRecording()
                 self.saveExperienceScreenshot(directory.appendingPathComponent("playback.png"))
@@ -1459,5 +1596,28 @@ extension AppDelegate {
         guard let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) else { return }
         window.effectiveAppearance.performAsCurrentDrawingAppearance { root.cacheDisplay(in: root.bounds, to: bitmap) }
         try? bitmap.representation(using: .png, properties: [:])?.write(to: url)
+    }
+}
+
+
+extension AppDelegate {
+    private func runAutomaticRecordingE2E(directory: URL) {
+        let started = Date()
+        var stopped = false
+        let testTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { timer in
+            let ready = self.recordingStarted.map { Date().timeIntervalSince($0) >= 2 } ?? false
+            if ready && !stopped {
+                self.recordButton.performClick(nil)
+                stopped = true
+            }
+            let completed = stopped && !self.recordingBusy && self.savedRecordings == 1 && self.library.entries.count == 1
+            guard completed || Date().timeIntervalSince(started) > 12 || self.lastRecordingError != nil else { return }
+            let passed = completed && self.selectedNetworkModule?.deviceID == "fixture-manual-device" && !self.camera.session.isRunning && self.lastRecordingError == nil
+            let report: [String: Any] = ["passed": passed, "automaticallyStarted": stopped, "savedRecordings": self.savedRecordings, "usbSessionStarted": self.camera.session.isRunning, "error": self.lastRecordingError ?? (completed ? "" : "Automatic Wi-Fi recording did not start")]
+            try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]).write(to: directory.appendingPathComponent("app-result.json"))
+            timer.invalidate()
+            NSApp.terminate(nil)
+        }
+        RunLoop.main.add(testTimer, forMode: .common)
     }
 }

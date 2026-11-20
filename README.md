@@ -59,7 +59,7 @@ open "WireCamera.app" --args --add-camera --module-device-id "设备ID"
 
 ## 实时与回放
 
-顶部切换「实时 / 回放」，右侧选择摄像头。「实时」画面右上角显示本机当前日期与时间。
+顶部切换「实时 / 回放」。「实时」右侧选择并连接摄像头，画面右上角显示本机当前日期与时间。「回放」右侧选择录像所属的摄像头，列表来自已保存的录像，设备离线、未发现或已移除时仍可查看。切换回放摄像头只筛选本地录像，不改变实时连接，也不影响后台录制。
 
 1. 在「实时」页等待画面出现，点击「开始录制」。录像自动保存到 `~/Movies/WireCamera/`，无需选择文件和声音选项。
 2. 切换到「回放」，选择日期和录像。录制会继续运行，每 60 秒保存一个片段；当前片段在完成保存后可播放。
@@ -74,6 +74,14 @@ USB 和 HA10 Wi-Fi 录制始终包含摄像头声音。USB 首次录制需要麦
 录制使用摄像头原生画面尺寸，镜像与开始录制时一致。录制期间不能切换摄像头、画面比例和镜像。USB 的「监听声音」只控制实时播放，不影响录像声音；建议使用耳机避免回声。
 
 录制先写入临时文件，片段完成后才加入回放列表。录制时退出应用或关闭窗口，会等待当前片段保存。设备断开、声音中断或存储空间不足时，应用会停止录制并提示结果；保存失败的临时文件位置会显示在错误提示中。意外断电或强制结束进程不保证临时文件可恢复。录像不会自动清理，请留意存储空间。
+
+应用退出后，可指定已保存的 Wi-Fi 摄像头并在画面、声音就绪后自动开始录制：
+
+```sh
+open "/Applications/WireCamera.app" --args --record-camera "设备ID"
+```
+
+此操作仍使用默认录像目录，录制始终包含摄像头声音。
 
 ## 从源码构建
 
@@ -119,10 +127,11 @@ zsh Tests/library-e2e.sh
 WIRECAMERA_E2E_SCENE=empty zsh Tests/library-e2e.sh
 zsh Tests/recording-interruption-e2e.sh
 zsh Tests/library-check.sh
+zsh Tests/automatic-recording-e2e.sh
 zsh Tests/module-audio-check.sh
 ```
 
-人物场景使用 NASA 宇航员照片，无人场景使用合成测试画面。测试通过真实应用控件连接本机模拟模块、录制带声音片段、切换回放、点击人物事件并重启检查恢复；同时使用 ffprobe 检查音视频轨与同步，使用 ffmpeg 完整解码。报告、截图、MOV 和解码日志位于 `.build/library-e2e/`。声音断流测试验证自动停止及可用文件保留，产物位于 `.build/recording-interruption-e2e/`。
+人物场景使用 NASA 宇航员照片，无人场景使用合成测试画面。测试通过真实应用控件连接本机模拟模块、录制带声音片段、切换回放、点击人物事件并重启检查恢复。测试还会把已录制样片复制为另一台离线摄像头的历史记录，验证录制期间切换回放来源、按日期筛选及重启后无需连接设备即可播放；同时使用 ffprobe 检查音视频轨与同步，使用 ffmpeg 完整解码。报告、截图、MOV 和解码日志位于 `.build/library-e2e/`。声音断流测试验证自动停止及可用文件保留，产物位于 `.build/recording-interruption-e2e/`。
 
 真实 HA10 录制验收：
 
@@ -130,7 +139,7 @@ zsh Tests/module-audio-check.sh
 WIRECAMERA_MODULE_DEVICE_ID="设备ID" WIRECAMERA_MODULE_ADDRESS="模块IP" zsh Tests/wifi-recording-e2e.sh
 ```
 
-该测试直接使用摄像头的图像与声音，产物位于 `.build/wifi-recording-e2e/`。测试通过不代表人物识别能覆盖所有环境。场景及失败边界见 [实时与回放验收](Tests/library-scenarios.md)，音频协议与已验证范围见 [Wi-Fi 声音验收](Tests/module-audio-scenarios.md)。所有测试使用项目内独立录像目录和设备文件，不修改日常使用的记录。
+该测试直接使用摄像头的图像与声音，产物位于 `.build/wifi-recording-e2e/`。测试通过不代表人物识别能覆盖所有环境。场景及失败边界见 [实时与回放验收](Tests/library-scenarios.md)，音频协议与已验证范围见 [Wi-Fi 声音验收](Tests/module-audio-scenarios.md)。自动录制启动测试验证指定 Wi-Fi 摄像头在图像与声音就绪后开始录制，并校验带声音样片，产物位于 `.build/automatic-recording-e2e/`。所有测试使用项目内独立录像目录和设备文件，不修改日常使用的记录。
 
 ## 模块验证与开发检查
 

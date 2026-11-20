@@ -6,7 +6,7 @@ cd "${0:A:h:h}"
 RUN_DIR="$PWD/.build/wifi-recording-e2e/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RUN_DIR"
 for pass_name in record restore; do
-  open -n --stderr "$RUN_DIR/$pass_name.log" "${1:-$PWD/WireCamera.app}" --args --library-e2e "$RUN_DIR" --library-pass "$pass_name" --fixture-address "$WIRECAMERA_MODULE_ADDRESS" --library-device-id "$WIRECAMERA_MODULE_DEVICE_ID" --allow-any-scene --verify-recording-clock --verify-playback-controls --recordings-path "$RUN_DIR/library" --module-store-path "$RUN_DIR/modules.json" --disable-module-scan
+  open -n --stderr "$RUN_DIR/$pass_name.log" "${1:-$PWD/WireCamera.app}" --args --library-e2e "$RUN_DIR" --library-pass "$pass_name" --fixture-address "$WIRECAMERA_MODULE_ADDRESS" --library-device-id "$WIRECAMERA_MODULE_DEVICE_ID" --allow-any-scene --verify-recording-clock --verify-playback-controls --verify-offline-playback --recordings-path "$RUN_DIR/library" --module-store-path "$RUN_DIR/modules.json" --disable-module-scan
   for attempt in {1..140}; do
     if [[ -f "$RUN_DIR/$pass_name-result.json" ]]; then break; fi
     sleep 1
