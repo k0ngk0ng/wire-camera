@@ -3,6 +3,8 @@ import Foundation
 
 @main
 struct CameraModuleManualFixture {
+    static let sessionLock = NSLock()
+    static var secondSessions = 0
     static func socketAddress(_ ip: String) -> sockaddr_in {
         var value = sockaddr_in()
         value.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -45,12 +47,13 @@ struct CameraModuleManualFixture {
         var audioPlaying = false
         var sequence: UInt64 = 1
         var secondCamera = false
+        var dropSecond = false
         var streamJPEG = jpeg
         let deadline = Date().addingTimeInterval(90)
         var nextFrame = Date()
         do {
             while Date() < deadline {
-                if secondCamera && sequence > 25 { return }
+                if dropSecond && sequence > 25 { return }
                 var event = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
                 if poll(&event, 1, 30) > 0 {
                     var bytes = [UInt8](repeating: 0, count: 4096)
@@ -64,6 +67,13 @@ struct CameraModuleManualFixture {
                             let deviceID = try CameraModuleNetworkProtocol.protobufString(frame.body, field: 2)
                             secondCamera = CommandLine.arguments.contains("--multi-camera") && deviceID == "fixture-preview-device"
                             guard deviceID == "fixture-manual-device" || secondCamera else { return }
+                            if secondCamera {
+                                sessionLock.lock()
+                                secondSessions += 1
+                                let session = secondSessions
+                                sessionLock.unlock()
+                                dropSecond = !CommandLine.arguments.contains("--keep-second-online") && (!CommandLine.arguments.contains("--recover-second") || session <= 2)
+                            }
                             if secondCamera { streamJPEG = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[3]).deletingLastPathComponent().appendingPathComponent("module-jpeg-frame.jpg")) }
                             body = CameraModuleNetworkProtocol.stringField(1, "fixture-session")
                         case 106: body = Data([8, 1])
