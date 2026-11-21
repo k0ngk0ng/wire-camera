@@ -4,6 +4,7 @@ import CoreMedia
 import CoreImage
 import UniformTypeIdentifiers
 import AVKit
+import Vision
 
 func cameraDevices() -> [AVCaptureDevice] {
     AVCaptureDevice.DiscoverySession(
@@ -98,6 +99,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private let playback = CameraPlaybackView(frame: .zero)
     private let liveTools = NSStackView()
     private var libraryTestDirectory: URL?
+    private var settingsTestDirectory: URL?
+    private var retentionReferenceDate: Date?
+    private let storageQueue = DispatchQueue(label: "camera.storage-summary", qos: .utility)
+    private var storageRefreshing = false
+    private var storageRefreshQueued = false
+    private var lastStorageRefresh = Date.distantPast
+    private var cleanupError: String?
+    private var lastRetentionResult: CameraRetentionResult?
     private var automaticRecordingDeviceID: String?
     private lazy var library: CameraRecordingLibrary = {
         let arguments = CommandLine.arguments
@@ -116,6 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var remoteVideoPermissionPending = false
     private var remoteState = "仅允许已配对的手机访问。Mac 需要保持运行。"
     private lazy var remoteIdentity: CameraRemoteIdentity = {
+        if let directory = settingsTestDirectory { return CameraRemoteIdentity(directory: directory.appendingPathComponent("remote")) }
         if let index = CommandLine.arguments.firstIndex(of: "--remote-server-test"), CommandLine.arguments.indices.contains(index + 1) { return CameraRemoteIdentity(directory: URL(fileURLWithPath: CommandLine.arguments[index + 1]).appendingPathComponent("remote")) }
         return CameraRemoteIdentity(directory: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/WireCamera/remote"))
     }()
@@ -218,6 +228,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var timer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if let index = CommandLine.arguments.firstIndex(of: "--settings-e2e"), CommandLine.arguments.indices.contains(index + 1) {
+            settingsTestDirectory = URL(fileURLWithPath: CommandLine.arguments[index + 1])
+            if let data = try? Data(contentsOf: settingsTestDirectory!.appendingPathComponent("manifest.json")), let manifest = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let now = manifest["now"] as? Double { retentionReferenceDate = Date(timeIntervalSince1970: now) }
+        }
         NSLog("WireCamera launched; camera permission=%ld audio permission=%ld", AVCaptureDevice.authorizationStatus(for: .video).rawValue, AVCaptureDevice.authorizationStatus(for: .audio).rawValue)
         if let index = CommandLine.arguments.firstIndex(of: "--record-camera"), CommandLine.arguments.indices.contains(index + 1) {
             automaticRecordingDeviceID = CommandLine.arguments[index + 1]
@@ -229,7 +243,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if let index = CommandLine.arguments.firstIndex(of: "--library-e2e"), CommandLine.arguments.indices.contains(index + 1) {
             libraryTestDirectory = URL(fileURLWithPath: CommandLine.arguments[index + 1])
         }
-        library.onChange = { [weak self] in self?.refreshPlayback() }
+        library.onChange = { [weak self] in self?.refreshPlayback(); self?.refreshStorage() }
+        library.onCleanup = { [weak self] result in
+            guard let self else { return }
+            self.lastRetentionResult = result
+            self.cleanupError = result.errors.isEmpty ? nil : "有 \(result.errors.count) 个文件未能清理，请检查文件权限。"
+            self.refreshStorage(force: true)
+            self.maintainRecordings()
+        }
         library.resumeIndexing()
         refreshPlayback()
         if let index = CommandLine.arguments.firstIndex(of: "--recording-e2e"), CommandLine.arguments.indices.contains(index + 1) {
@@ -320,8 +341,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        if automaticRecordingDeviceID == nil && !savedModuleTesting && libraryTestDirectory == nil && !CommandLine.arguments.contains("--disable-module-scan") { moduleScanner.scanNearby(onDevice: { [weak self] device in self?.registerNearbyModule(device) }, completion: { _ in }) }
-        if automaticRecordingDeviceID == nil && libraryTestDirectory == nil && moduleTestDirectory == nil && modulePreviewTestDirectory == nil && !CommandLine.arguments.contains("--add-camera") { requestCamera() }
+        if settingsTestDirectory == nil && automaticRecordingDeviceID == nil && !savedModuleTesting && libraryTestDirectory == nil && !CommandLine.arguments.contains("--disable-module-scan") { moduleScanner.scanNearby(onDevice: { [weak self] device in self?.registerNearbyModule(device) }, completion: { _ in }) }
+        if settingsTestDirectory == nil && automaticRecordingDeviceID == nil && libraryTestDirectory == nil && moduleTestDirectory == nil && modulePreviewTestDirectory == nil && !CommandLine.arguments.contains("--add-camera") { requestCamera() }
         recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             guard let self else { return }
             if !self.previewSuspended { self.liveClock.stringValue = self.liveClockFormatter.string(from: Date()) }
@@ -333,6 +354,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             self.updateRecordingControls()
         }
         if let recordingTimer { RunLoop.main.add(recordingTimer, forMode: .common) }
+        let cleanupTimer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in self?.maintainRecordings() }
+        RunLoop.main.add(cleanupTimer, forMode: .common)
+        maintainRecordings()
         if let deviceID = automaticRecordingDeviceID {
             let address = moduleStore.devices.first(where: { $0.deviceID == deviceID })?.address
             beginModuleConnection(CameraModuleIdentity(deviceID: deviceID, salt: "", address: address))
@@ -366,6 +390,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             }
             runModulePreviewE2E()
         }
+        if let directory = settingsTestDirectory { window.title = "WireCamera Settings Test"; runSettingsE2E(directory: directory) }
     }
 
     private func buildMenu() {
@@ -373,7 +398,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "关于 WireCamera", action: #selector(showAbout), keyEquivalent: "")
-        appMenu.addItem(withTitle: "iPhone 连接…", action: #selector(showRemoteAccess), keyEquivalent: ",")
+        appMenu.addItem(withTitle: "设置…", action: #selector(showStorageSettings), keyEquivalent: ",")
+        appMenu.addItem(withTitle: "iPhone 连接…", action: #selector(showRemoteAccess), keyEquivalent: "")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "退出 WireCamera", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
@@ -1943,6 +1969,7 @@ extension AppDelegate {
         guard menu === trayMenu else { return }
         menu.removeAllItems()
         menu.addItem(withTitle: "打开 WireCamera", action: #selector(showMainWindow), keyEquivalent: "")
+        menu.addItem(withTitle: "设置…", action: #selector(showStorageSettings), keyEquivalent: "")
         menu.addItem(withTitle: "iPhone 连接…", action: #selector(showRemoteAccess), keyEquivalent: "")
         if !activeRecordingSources.isEmpty {
             menu.addItem(.separator())
@@ -2080,34 +2107,73 @@ extension AppDelegate {
 }
 
 extension AppDelegate {
-    @objc private func showRemoteAccess() { remotePanel.show(settings: remoteIdentity.settings, status: remoteState) }
+    @objc private func showRemoteAccess() { remotePanel.show(settings: remoteIdentity.settings, status: remoteState); refreshStorage(force: true) }
+    @objc private func showStorageSettings() { remotePanel.show(settings: remoteIdentity.settings, status: remoteState, section: .recording); refreshStorage(force: true) }
+
+    private func maintainRecordings(force: Bool = false) {
+        var protected: Set<String> = []
+        if modePicker.selectedSegment == 1, let asset = playback.player.currentItem?.asset as? AVURLAsset { protected.insert(asset.url.deletingPathExtension().lastPathComponent) }
+        if force { lastRetentionResult = nil }
+        library.enforceRetention(days: remoteIdentity.settings.retentionDays, now: retentionReferenceDate ?? Date(), protecting: protected, force: force)
+    }
+
+    private func refreshStorage(force: Bool = false) {
+        guard remotePanel.window.isVisible, force || Date().timeIntervalSince(lastStorageRefresh) >= 5 else { return }
+        if storageRefreshing { storageRefreshQueued = storageRefreshQueued || force; return }
+        storageRefreshing = true; lastStorageRefresh = Date()
+        let entries = library.entries, directory = library.directory
+        let activeSources = Set(activeRecordingSources.map { $0.id })
+        let sourceIDs: Set<String>? = activeSources.isEmpty ? liveSourceID.map { Set([$0]) } : activeSources
+        storageQueue.async {
+            let summary = CameraStorageSummary.inspect(directory: directory, entries: entries, sourceIDs: sourceIDs)
+            DispatchQueue.main.async {
+                self.storageRefreshing = false
+                self.remotePanel.updateStorage(summary, cleaning: self.library.isCleaning, error: self.cleanupError)
+                if self.storageRefreshQueued { self.storageRefreshQueued = false; self.refreshStorage(force: true) }
+            }
+        }
+    }
 
     private func configureRemoteAccess() {
         remoteMedia.onPacket = { [weak self] data, kind, sourceID in self?.remoteServer.publish(data, kind: kind, sourceID: sourceID) }
         remoteServer.onCameras = { [weak self] in self?.remoteDevices() ?? [] }
         remoteServer.onRecordings = { [weak self] in self?.library.entries ?? [] }
-        remoteServer.onMovieURL = { [weak self] entry in
-            guard let self else { return nil }
-            let movie = self.library.movieURL(entry).resolvingSymlinksInPath()
-            guard movie.deletingLastPathComponent() == self.library.directory.resolvingSymlinksInPath() else { return nil }
-            return movie
-        }
+        remoteServer.onMovieAccess = { [weak self] entry in self?.library.access(entry) }
         remoteServer.onViewersChanged = { [weak self] sources in
             guard let self else { return }
             self.remoteViewers = sources
             self.remoteMedia.setViewers(sources)
             self.refreshRemoteFeeds()
         }
-        remoteServer.onState = { [weak self] message in self?.remoteState = message }
+        remoteServer.onState = { [weak self] message in
+            guard let self else { return }
+            self.remoteState = message
+            if self.remotePanel.window.isVisible { self.remotePanel.update(settings: self.remoteIdentity.settings, status: message) }
+        }
         remotePanel.onChange = { [weak self] settings in
             guard let self else { return }
             do {
+                let previous = self.remoteIdentity.settings
                 try self.remoteIdentity.save(settings)
+                if previous.enabled == settings.enabled && previous.port == settings.port && previous.password == settings.password { return }
                 self.remoteServer.stop()
                 if settings.enabled { self.startRemoteAccess(showPanel: true) }
                 else { self.remoteState = "手机连接已关闭。"; self.showRemoteAccess() }
             } catch { self.remoteState = error.localizedDescription; self.showRemoteAccess() }
         }
+        remotePanel.onRetention = { [weak self] days in
+            guard let self else { return }
+            var settings = self.remoteIdentity.settings
+            settings.recordingRetentionDays = days
+            do {
+                try self.remoteIdentity.save(settings)
+                self.cleanupError = nil
+                self.remotePanel.update(settings: settings, status: self.remoteState)
+                self.maintainRecordings(force: true)
+                self.refreshStorage(force: true)
+            } catch { self.remotePanel.showError(error.localizedDescription) }
+        }
+        remotePanel.onCleanupNow = { [weak self] in self?.maintainRecordings(force: true); self?.refreshStorage(force: true) }
         if CommandLine.arguments.contains("--remote-server-test") {
             window.title = "WireCamera Test"
             var settings = remoteIdentity.settings
@@ -2123,12 +2189,13 @@ extension AppDelegate {
     }
 
     private func startRemoteAccess(showPanel: Bool = false) {
+        remoteState = "正在开启…"
         do {
             try remoteServer.start(identity: remoteIdentity) { [weak self] result in
                 guard let self else { return }
                 switch result {
                 case .success(let port):
-                    self.remoteState = "已开启加密连接。手机与 Mac 连接同一局域网后，扫描二维码或输入地址与密码。"
+                    self.remoteState = "已开启 · 允许已配对的 iPhone 访问"
                     if let index = CommandLine.arguments.firstIndex(of: "--remote-server-test"), CommandLine.arguments.indices.contains(index + 1) {
                         let report: [String: Any] = ["port": port, "password": self.remoteIdentity.settings.password, "fingerprint": self.remoteIdentity.fingerprint]
                         try? JSONSerialization.data(withJSONObject: report).write(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]).appendingPathComponent("server-ready.json"))
@@ -2293,6 +2360,150 @@ extension AppDelegate {
                     finish(errors.isEmpty ? nil : errors.joined(separator: "\n"))
                 }
                 timer.invalidate(); NSApp.terminate(nil)
+            }
+        }
+        RunLoop.main.add(testTimer, forMode: .common)
+    }
+}
+
+extension AppDelegate {
+    private func runSettingsE2E(directory: URL) {
+        guard let data = try? Data(contentsOf: directory.appendingPathComponent("manifest.json")),
+              let manifest = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let movies = manifest["movies"] as? [String: String] else { return }
+        let restoring = CommandLine.arguments.contains("restore")
+        let pass = restoring ? "restore" : "first"
+        let started = Date()
+        var phase = 0
+        var finishedAt = Date()
+        var checks: [[String: Any]] = []
+        let originalPort = remoteIdentity.settings.port
+        let originalPassword = remoteIdentity.settings.password
+        func check(_ name: String, _ passed: Bool) { checks.append(["name": name, "passed": passed]) }
+        func exists(_ name: String, _ suffix: String = "mov") -> Bool { FileManager.default.fileExists(atPath: self.library.directory.appendingPathComponent((movies[name] ?? "") + "." + suffix).path) }
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
+        func control(_ id: String) -> NSView? { self.remotePanel.window.contentView.flatMap { descendants($0).first { $0.accessibilityIdentifier() == id } } }
+        func button(_ id: String) -> NSButton? { control(id) as? NSButton }
+        func edit(_ id: String, _ value: String) {
+            guard let field = control(id) as? NSTextField else { return }
+            field.stringValue = value
+            self.remotePanel.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: field))
+        }
+        func policy(_ days: Int) {
+            guard let picker = control("settings-retention") as? NSPopUpButton else { return }
+            picker.selectItem(withTag: days)
+            picker.sendAction(picker.action, to: picker.target)
+        }
+        func capture(_ filename: String) {
+            guard let root = self.remotePanel.window.contentView else { return }
+            root.layoutSubtreeIfNeeded()
+            guard let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) else { return }
+            self.remotePanel.window.effectiveAppearance.performAsCurrentDrawingAppearance { root.cacheDisplay(in: root.bounds, to: bitmap) }
+            guard let cgImage = bitmap.cgImage else { return }
+            let image = CIImage(cgImage: cgImage)
+            let background = CIImage(color: CIColor(red: 0.12, green: 0.12, blue: 0.13)).cropped(to: image.extent)
+            if let composed = CIContext().createCGImage(image.composited(over: background), from: image.extent) { try? NSBitmapImageRep(cgImage: composed).representation(using: .png, properties: [:])?.write(to: directory.appendingPathComponent(filename)) }
+        }
+        func write(_ name: String, _ report: [String: Any]) { try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]).write(to: directory.appendingPathComponent(name), options: .atomic) }
+        func finish(_ error: String? = nil) {
+            write(pass + "-result.json", ["passed": error == nil && checks.allSatisfy { $0["passed"] as? Bool == true }, "checks": checks, "error": error ?? ""])
+            NSApp.terminate(nil)
+        }
+        if restoring { showStorageSettings() }
+        else {
+            showRemoteAccess()
+            check("legacy_configuration_keeps_forever", remoteIdentity.settings.retentionDays == 0 && exists("old") && exists("exact"))
+            check("connection_starts_disabled", remoteIdentity.settings.enabled == false)
+            edit("settings-port", "0")
+            check("invalid_port_cannot_save", button("settings-save-connection")?.isEnabled == false && remoteIdentity.settings.port == originalPort)
+            edit("settings-port", String(originalPort))
+            edit("settings-password", "short")
+            check("short_password_cannot_save", button("settings-save-connection")?.isEnabled == false && remoteIdentity.settings.password == originalPassword)
+            edit("settings-password", originalPassword)
+            button("settings-reveal")?.performClick(nil)
+            check("password_can_be_revealed", control("settings-password")?.isHidden == true)
+            button("settings-reveal")?.performClick(nil)
+            capture("connection-disabled.png")
+            if let service = control("settings-service") as? NSSwitch { service.state = .on; service.sendAction(service.action, to: service.target) }
+        }
+        let testTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { timer in
+            if Date().timeIntervalSince(started) > 55 { timer.invalidate(); finish("Timed out at phase \(phase)"); return }
+            if restoring {
+                if phase == 0 {
+                    guard self.remoteServer.port > 0 else { return }
+                    check("retention_restored_after_restart", self.remoteIdentity.settings.retentionDays == 7)
+                    check("connection_settings_preserved", self.remoteIdentity.settings.port == originalPort && self.remoteIdentity.settings.password == originalPassword && self.remoteIdentity.settings.enabled)
+                    check("expired_recordings_stay_removed", !exists("old") && !exists("playing") && !exists("downloading") && !exists("indexing", "json"))
+                    check("boundary_and_recent_recordings_survive_restart", exists("cross") && exists("recent") && exists("future"))
+                    capture("recording-restored.png")
+                    write("restore-ui-ready.json", ["port": self.remoteServer.port])
+                    phase = 1
+                } else if FileManager.default.fileExists(atPath: directory.appendingPathComponent("restore-network-checked").path) {
+                    check("old_iphone_token_and_certificate_still_work", true)
+                    timer.invalidate(); finish()
+                }
+                return
+            }
+            switch phase {
+            case 0:
+                guard self.remoteServer.port > 0, self.remoteState.hasPrefix("已开启") else { return }
+                if let view = control("settings-qr") as? NSImageView, let image = view.image?.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                    let request = VNDetectBarcodesRequest()
+                    request.symbologies = [.qr]
+                    try? VNImageRequestHandler(cgImage: image).perform([request])
+                    let url = request.results?.first?.payloadStringValue.flatMap { URLComponents(string: $0) }
+                    check("qr_compatible_with_existing_iphone", url?.scheme == "wirecamera" && url?.host == "pair" && url?.queryItems?.first(where: { $0.name == "password" })?.value == originalPassword)
+                } else { check("qr_compatible_with_existing_iphone", false) }
+                capture("connection-enabled.png")
+                write("first-ui-ready.json", ["port": self.remoteServer.port])
+                phase = 1
+            case 1:
+                guard FileManager.default.fileExists(atPath: directory.appendingPathComponent("client-reading").path),
+                      self.library.activeReaders(movies["downloading"] ?? "") > 0 else { return }
+                self.showStorageSettings()
+                check("keep_forever_disables_manual_cleanup", button("settings-cleanup-now")?.isEnabled == false)
+                policy(-1); edit("settings-retention-days", "0")
+                check("invalid_retention_cannot_save", button("settings-save-retention")?.isEnabled == false && self.remoteIdentity.settings.retentionDays == 0)
+                policy(7)
+                check("unsaved_policy_cannot_cleanup", button("settings-cleanup-now")?.isEnabled == false)
+                self.modePicker.selectedSegment = 1; self.changeMode()
+                if let id = movies["playing"], let entry = self.library.entries.first(where: { $0.id == id }) { self.playback.player.replaceCurrentItem(with: AVPlayerItem(url: self.library.movieURL(entry))) }
+                if let id = movies["indexing"], let entry = self.library.entries.first(where: { $0.id == id }) { self.library.index(entry) }
+                button("settings-save-retention")?.performClick(nil)
+                check("saving_policy_starts_cleanup_immediately", (self.library.isCleaning || self.lastRetentionResult != nil) && self.remoteIdentity.settings.retentionDays == 7)
+                phase = 2
+            case 2:
+                guard !self.library.isCleaning, let result = self.lastRetentionResult else { return }
+                check("expired_movies_and_indexes_removed", !exists("old") && !exists("old", "json") && !exists("exact") && !exists("indexing") && !exists("orphan", "json"))
+                check("crossing_cutoff_recent_and_future_preserved", exists("cross") && exists("recent") && exists("future"))
+                check("active_playback_and_http_reader_protected", exists("playing") && exists("downloading"))
+                check("partial_unrelated_and_external_files_preserved", FileManager.default.fileExists(atPath: self.library.directory.appendingPathComponent(".active.partial.mov").path) && FileManager.default.fileExists(atPath: self.library.directory.appendingPathComponent("notes.json").path) && exists("symlink") && FileManager.default.fileExists(atPath: directory.appendingPathComponent("outside.mov").path))
+                check("deletion_error_is_reported_and_retryable", exists("locked") && exists("locked", "json") && !result.errors.isEmpty)
+                check("retention_save_does_not_restart_iphone_service", self.remoteServer.port == originalPort && self.remoteIdentity.settings.password == originalPassword)
+                capture("recording-cleanup.png")
+                write("cleanup-ready.json", ["passed": true])
+                phase = 3
+            case 3:
+                guard FileManager.default.fileExists(atPath: directory.appendingPathComponent("client-released").path),
+                      self.library.activeReaders(movies["downloading"] ?? "") == 0,
+                      button("settings-cleanup-now")?.isEnabled == true else { return }
+                self.modePicker.selectedSegment = 0; self.changeMode()
+                self.playback.player.replaceCurrentItem(with: nil)
+                if let id = movies["locked"] { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: self.library.directory.appendingPathComponent(id + ".mov").path) }
+                button("settings-cleanup-now")?.performClick(nil)
+                check("manual_cleanup_starts_immediately", self.library.isCleaning || self.lastRetentionResult != nil)
+                phase = 4
+            default:
+                guard !self.library.isCleaning, let result = self.lastRetentionResult else { return }
+                if phase == 4 {
+                    check("released_readers_and_unlocked_files_removed", !exists("playing") && !exists("downloading") && !exists("locked"))
+                    check("cleanup_retry_succeeds", result.errors.isEmpty)
+                    finishedAt = Date(); phase = 5; return
+                }
+                guard Date().timeIntervalSince(finishedAt) > 1.5 else { return }
+                check("cancelled_index_does_not_recreate_sidecar", !exists("indexing", "json"))
+                capture("recording-finished.png")
+                timer.invalidate(); finish()
             }
         }
         RunLoop.main.add(testTimer, forMode: .common)

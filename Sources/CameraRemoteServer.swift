@@ -9,6 +9,7 @@ private final class CameraRemotePeer {
     var queuedBytes = 0
     var closed = false
     var file: FileHandle?
+    var access: CameraRecordingAccess?
 
     init(_ connection: NWConnection) { self.connection = connection }
 }
@@ -25,7 +26,7 @@ final class CameraRemoteServer {
     private(set) var port: UInt16 = 0
     var onCameras: (() -> [CameraRemoteDevice])?
     var onRecordings: (() -> [CameraRecording])?
-    var onMovieURL: ((CameraRecording) -> URL?)?
+    var onMovieAccess: ((CameraRecording) -> CameraRecordingAccess?)?
     var onViewersChanged: ((Set<String>) -> Void)?
     var onState: ((String) -> Void)?
 
@@ -99,6 +100,7 @@ final class CameraRemoteServer {
         peer.closed = true
         try? peer.file?.close()
         peer.file = nil
+        peer.access = nil
         peers.removeValue(forKey: peer.id)
         peer.connection.cancel()
         if peer.sourceID != nil { viewersChanged() }
@@ -195,10 +197,12 @@ final class CameraRemoteServer {
             let id = String(components[2])
             DispatchQueue.main.async {
                 let entry = self.onRecordings?().first { $0.id == id }
-                let movie = entry.flatMap { self.onMovieURL?($0) ?? nil }
+                let access = entry.flatMap { self.onMovieAccess?($0) ?? nil }
                 self.queue.async {
-                    guard let movie else { self.respond(peer, status: 404); return }
-                    self.movie(peer, url: movie, range: headers["range"], head: method == "HEAD")
+                    guard !peer.closed else { return }
+                    guard let access else { self.respond(peer, status: 404); return }
+                    peer.access = access
+                    self.movie(peer, url: access.url, range: headers["range"], head: method == "HEAD")
                 }
             }
         }

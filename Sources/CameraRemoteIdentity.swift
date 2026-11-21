@@ -7,6 +7,8 @@ struct CameraRemoteSettings: Codable {
     var port: UInt16 = 48760
     var password = String(CameraRemoteCoding.randomSecret().prefix(24))
     var identityPassword = CameraRemoteCoding.randomSecret()
+    var recordingRetentionDays: Int?
+    var retentionDays: Int { recordingRetentionDays ?? 0 }
 }
 
 final class CameraRemoteIdentity {
@@ -21,6 +23,7 @@ final class CameraRemoteIdentity {
 
     func save(_ value: CameraRemoteSettings) throws {
         guard value.password.utf8.count >= 12 else { throw failure("连接密码至少需要 12 个字符。") }
+        guard (0...3650).contains(value.retentionDays) else { throw failure("录像保留天数应为 1–3650 天，或选择永久保留。") }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let url = directory.appendingPathComponent("settings.json")
         try JSONEncoder().encode(value).write(to: url, options: .atomic)

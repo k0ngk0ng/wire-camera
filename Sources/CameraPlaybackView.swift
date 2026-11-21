@@ -223,14 +223,21 @@ final class CameraPlaybackView: NSView {
             updateCursor()
             return
         }
+        guard let library, let access = library.access(position.recording) else {
+            clearSelection()
+            cursor = date
+            empty.isHidden = false
+            empty.stringValue = "这段录像已到期或正在清理"
+            updateCursor()
+            return
+        }
         cursor = position.recording.startedAt.addingTimeInterval(position.offset)
         wantsPlayback = autoplay
         seeking = true
         selected = position.recording
         if (player.currentItem?.asset as? AVURLAsset)?.url.lastPathComponent != position.recording.filename {
-            guard let library else { return }
             player.pause()
-            player.replaceCurrentItem(with: AVPlayerItem(url: library.movieURL(position.recording)))
+            player.replaceCurrentItem(with: AVPlayerItem(url: access.url))
         }
         empty.isHidden = true
         updateCursor()
