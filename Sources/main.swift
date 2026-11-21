@@ -87,8 +87,12 @@ final class PreviewView: NSView {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     private var window: NSWindow!
+    private var statusItem: NSStatusItem?
+    private let trayMenu = NSMenu()
+    private var previewSuspended = false
+    private var backgroundActivity: NSObjectProtocol?
     private var camera = CameraController()
     private let modePicker = NSSegmentedControl(labels: ["实时", "回放"], trackingMode: .selectOne, target: nil, action: nil)
     private let playback = CameraPlaybackView(frame: .zero)
@@ -103,6 +107,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return CameraRecordingLibrary(directory: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Movies/WireCamera"))
     }()
     private var recordingSources: [String: CameraRecordingSource] = [:]
+    private let remoteServer = CameraRemoteServer()
+    private let remoteMedia = CameraRemoteMedia()
+    private let remotePanel = CameraRemotePanel()
+    private var remoteViewers: Set<String> = []
+    private var remoteNetworks: [String: CameraModuleNetwork] = [:]
+    private var remoteCameras: [String: CameraController] = [:]
+    private var remoteVideoPermissionPending = false
+    private var remoteState = "仅允许已配对的手机访问。Mac 需要保持运行。"
+    private lazy var remoteIdentity: CameraRemoteIdentity = {
+        if let index = CommandLine.arguments.firstIndex(of: "--remote-server-test"), CommandLine.arguments.indices.contains(index + 1) { return CameraRemoteIdentity(directory: URL(fileURLWithPath: CommandLine.arguments[index + 1]).appendingPathComponent("remote")) }
+        return CameraRemoteIdentity(directory: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/WireCamera/remote"))
+    }()
     private var recordingSource: CameraRecordingSource? { liveSourceID.flatMap { recordingSources[$0] } }
     private var activeRecordingSources: [CameraRecordingSource] { recordingSources.values.filter { $0.isActive } }
     private var recordingRequested: Bool {
@@ -208,6 +224,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         buildMenu()
         buildWindow()
+        buildTray()
         bindCamera(camera)
         if let index = CommandLine.arguments.firstIndex(of: "--library-e2e"), CommandLine.arguments.indices.contains(index + 1) {
             libraryTestDirectory = URL(fileURLWithPath: CommandLine.arguments[index + 1])
@@ -259,7 +276,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         moduleNetwork.onSampleBuffer = { [weak self] sample in
             DispatchQueue.main.async {
-                guard let self, self.selectedNetworkModule != nil else { return }
+                guard let self, !self.previewSuspended, self.selectedNetworkModule != nil else { return }
                 self.preview.enqueue(sample)
                 if self.modulePreviewTestDirectory != nil { self.modulePreviewSample = sample }
             }
@@ -286,6 +303,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.moduleLastError = message
             self.showMessage("模块画面连接中断", message)
         }
+        configureRemoteAccess()
         for name in [AVCaptureDevice.wasConnectedNotification, AVCaptureDevice.wasDisconnectedNotification] {
             observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 self?.refreshDevices()
@@ -293,10 +311,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             guard let self else { return }
+            self.refreshRemoteFeeds()
             for source in self.activeRecordingSources where source.busy && !source.finishing && source.segmentStartedAt != nil {
-                if Date().timeIntervalSince(source.lastVideoAt) > 8 { self.stopRecording(source, error: "录制摄像头的画面已中断，当前片段正在保存。") }
+                if Date().timeIntervalSince(source.lastVideoAt) > 8 { self.stopRecording(source, error: "录制摄像头的画面已中断，当前片段正在保存。", recovering: true) }
             }
-            guard self.selectedID != nil || self.selectedNetworkModule != nil, Date().timeIntervalSince(self.lastFrameAt) > 8 else { return }
+            guard !self.previewSuspended, self.selectedID != nil || self.selectedNetworkModule != nil, Date().timeIntervalSince(self.lastFrameAt) > 8 else { return }
             self.showMessage("暂未收到画面", self.selectedNetworkModule == nil ? "请检查 USB 连接，或关闭正在使用摄像头的其他应用，然后点击重试。" : "请确认模块保持供电、Wi-Fi 连接正常，然后重新连接模块。")
         }
         window.makeKeyAndOrderFront(nil)
@@ -305,9 +324,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if automaticRecordingDeviceID == nil && libraryTestDirectory == nil && moduleTestDirectory == nil && modulePreviewTestDirectory == nil && !CommandLine.arguments.contains("--add-camera") { requestCamera() }
         recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             guard let self else { return }
-            self.liveClock.stringValue = self.liveClockFormatter.string(from: Date())
-            let segmentSeconds: Double = self.libraryTestDirectory == nil || CommandLine.arguments.contains("--expect-audio-interruption") ? 60 : 4
+            if !self.previewSuspended { self.liveClock.stringValue = self.liveClockFormatter.string(from: Date()) }
+            let segmentSeconds: Double = (self.libraryTestDirectory == nil && !CommandLine.arguments.contains("--verify-background")) || CommandLine.arguments.contains("--expect-audio-interruption") ? 60 : 4
             for source in self.activeRecordingSources {
+                if source.requested && !source.busy && !source.preparing && !source.finishing, let retryAt = source.retryAt, retryAt <= Date() { self.retryRecording(source) }
                 if source.requested && !source.finishing, let started = source.segmentStartedAt, Date().timeIntervalSince(started) >= segmentSeconds { self.stopRecording(source, rotating: true) }
             }
             self.updateRecordingControls()
@@ -321,7 +341,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             runAutomaticRecordingE2E(directory: URL(fileURLWithPath: CommandLine.arguments[index + 1]))
         }
         if libraryTestDirectory != nil {
-            if CommandLine.arguments.contains("--multi-recording-e2e") { runMultiRecordingE2E() }
+            if CommandLine.arguments.contains("--recording-recovery-e2e") { runRecordingRecoveryE2E() }
+            else if CommandLine.arguments.contains("--multi-recording-e2e") { runMultiRecordingE2E() }
             else if CommandLine.arguments.contains("--record-preview-e2e") { runRecordPreviewE2E() }
             else { runLibraryE2E() }
         }
@@ -352,6 +373,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "关于 WireCamera", action: #selector(showAbout), keyEquivalent: "")
+        appMenu.addItem(withTitle: "iPhone 连接…", action: #selector(showRemoteAccess), keyEquivalent: ",")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "退出 WireCamera", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
@@ -362,6 +384,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         fullscreen.keyEquivalentModifierMask = [.command, .control]
         viewMenu.addItem(withTitle: "重新连接", action: #selector(reconnect), keyEquivalent: "r")
         viewMenu.addItem(withTitle: "添加摄像头…", action: #selector(showModuleConnection), keyEquivalent: "n")
+        viewMenu.addItem(withTitle: "收起到菜单栏", action: #selector(hideMainWindow), keyEquivalent: "w")
         viewItem.submenu = viewMenu
         menu.addItem(viewItem)
         NSApp.mainMenu = menu
@@ -569,10 +592,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.recordingChanged(event, source: source)
         }
         controller.onSampleBuffer = { [weak self, weak controller] sample in
+            if let self, let controller, let id = controller.deviceID { self.remoteMedia.video(sample, sourceID: "usb:" + id, mirrored: false) }
             DispatchQueue.main.async {
-                guard let self, let controller, self.camera === controller, self.selectedNetworkModule == nil, self.selectedID != nil else { return }
+                guard let self, let controller, !self.previewSuspended, self.camera === controller, self.selectedNetworkModule == nil, self.selectedID != nil else { return }
                 self.preview.enqueue(sample)
             }
+        }
+        controller.onAudioSampleBuffer = { [weak self, weak controller] sample in
+            if let self, let id = controller?.deviceID { self.remoteMedia.audio(sample, sourceID: "usb:" + id) }
         }
         controller.onFrame = { [weak self, weak controller] width, height, fps in
             guard let self, let controller else { return }
@@ -591,7 +618,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         controller.onError = { [weak self, weak controller] message in
             guard let self, let controller else { return }
-            if let source = self.sourceForCamera(controller) { self.stopRecording(source, error: message) }
+            if let id = controller.deviceID { self.remoteServer.publish(Data(message.utf8), kind: 3, sourceID: "usb:" + id) }
+            if let source = self.sourceForCamera(controller), source.requested { self.stopRecording(source, error: message, recovering: true) }
             if self.camera === controller && self.selectedNetworkModule == nil && self.selectedID != nil { self.showMessage("摄像头暂时不可用", message) }
         }
     }
@@ -599,7 +627,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func sourceForCamera(_ controller: CameraController) -> CameraRecordingSource? { activeRecordingSources.first { $0.camera === controller } }
 
     private func leaveCameraPreview() {
-        if sourceForCamera(camera) != nil { camera.setVolume(0) }
+        if let id = camera.deviceID, remoteViewers.contains("usb:" + id) { remoteCameras["usb:" + id] = camera; camera.setVolume(0) }
+        else if sourceForCamera(camera) != nil { camera.setVolume(0) }
         else { camera.stop() }
     }
 
@@ -622,7 +651,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let connectedDevices = cameraDevices()
         for source in activeRecordingSources where source.camera != nil {
             let found = connectedDevices.contains { "usb:" + $0.uniqueID == source.id }
-            if !found || source.audioDevice?.isConnected == false { stopRecording(source, error: "录制摄像头或它的声音设备已断开。") }
+            if (!found || source.audioDevice?.isConnected == false) && !source.recovering { stopRecording(source, error: "录制摄像头或它的声音设备已断开。", recovering: true) }
         }
         if selectedNetworkModule != nil {
             if !force { devices = cameraDevices(); updateNetworkPicker(); updateRecordingControls(); return }
@@ -656,6 +685,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let retained = recordingSources["usb:" + device.uniqueID].flatMap { $0.isActive ? $0 : nil }
         leaveCameraPreview()
         if let retained, let controller = retained.camera { camera = controller }
+        else if let controller = remoteCameras["usb:" + device.uniqueID] { camera = controller }
         else { camera = CameraController(); bindCamera(camera) }
         if selectedNetworkModule != nil { moduleNetwork.stop(); selectedNetworkModule = nil; preview.reset() }
         recordButton.toolTip = nil
@@ -676,8 +706,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         refreshPlayback()
         lastFrameAt = Date()
         showMessage("正在连接摄像头", device.localizedName, canRetry: false)
-        if let retained {
-            mirror.state = retained.mirrored ? .on : .off
+        if retained != nil || remoteCameras["usb:" + device.uniqueID] === camera {
+            if let retained { mirror.state = retained.mirrored ? .on : .off }
             toggleMirror()
             updateRecordingControls()
             return
@@ -864,7 +894,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             .credits: NSAttributedString(string: "摄像头预览、声音监听与本地录制。\n音视频仅在本机处理，不上传。")
         ])
     }
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate()
         recordingTimer?.invalidate()
@@ -874,6 +904,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         for source in recordingSources.values { source.network?.stop() }
         moduleNetwork.stop()
         moduleScanner.stop()
+        remoteServer.stop()
+        remoteNetworks.values.forEach { $0.stop() }
+        if let backgroundActivity { ProcessInfo.processInfo.endActivity(backgroundActivity) }
+        if let statusItem { NSStatusBar.system.removeStatusItem(statusItem) }
+        for controller in remoteCameras.values where stopped.insert(ObjectIdentifier(controller)).inserted { controller.shutdown() }
     }
 
     private func refreshAudioDevice() {
@@ -889,6 +924,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func updateRecordingControls() {
+        let keepAwake = !activeRecordingSources.isEmpty || remoteIdentity.settings.enabled
+        if keepAwake && backgroundActivity == nil { backgroundActivity = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled], reason: "保持摄像头录制和手机连接") }
+        else if !keepAwake, let backgroundActivity { ProcessInfo.processInfo.endActivity(backgroundActivity); self.backgroundActivity = nil }
+        if previewSuspended { return }
         let isPlayback = modePicker.selectedSegment == 1
         let source = controlledSourceID.flatMap { recordingSources[$0] }
         let active = source?.isActive ?? false
@@ -913,7 +952,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         recordButton.title = source?.finishing == true ? "正在保存…" : (active ? "停止录制" : "开始录制")
         if !active && controlledSourceID == liveSourceID && liveSourceID != nil && !soundReady && !awaitingFrames { recordButton.title = selectedNetworkModule == nil ? "摄像头声音未连接" : "正在连接声音…" }
         if let source {
-            if active { recordingTime.stringValue = source.startedAnySegment ? source.elapsedText : "准备录制…" }
+            if active { recordingTime.stringValue = source.recovering ? source.elapsedText + " · 等待重连" : (source.startedAnySegment ? source.elapsedText : "准备录制…") }
             else { recordingTime.stringValue = source.elapsedText + " · " + source.status }
         } else { recordingTime.stringValue = "00:00:00" }
         recordingTime.textColor = active ? .systemRed : .secondaryLabelColor
@@ -1018,14 +1057,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         beginRecording(to: target, source: source)
     }
 
+    private func scheduleRecordingRetry(_ source: CameraRecordingSource, error: String?) {
+        source.recovering = true; source.rotating = false
+        source.freezeClock()
+        source.lastError = error
+        source.status = "等待重连"
+        source.retryAttempt += 1
+        source.retryAt = Date().addingTimeInterval(min(30, pow(2, Double(min(5, source.retryAttempt - 1)))))
+        releaseRecordingMedia(source)
+        updateRecordingControls()
+    }
+
+    private func retryRecording(_ source: CameraRecordingSource) {
+        guard source.requested, !pendingTermination else { return }
+        source.retryAt = nil; source.failure = nil; source.lastVideoAt = Date()
+        let begin: () -> Void = { [weak self, weak source] in
+            guard let self, let source, source.requested else { return }
+            do { try self.startNextRecording(source) }
+            catch { source.requested = false; source.recovering = false; source.lastError = error.localizedDescription; source.status = "无法录制"; self.releaseRecordingMedia(source); self.updateRecordingControls(); self.showRecordingError(source.name + "：" + error.localizedDescription) }
+        }
+        if let controller = source.camera {
+            guard let device = cameraDevices().first(where: { "usb:" + $0.uniqueID == source.id }), let audio = cameraAudioDevice(for: device), audio.isConnected else { source.retryAt = Date().addingTimeInterval(2); return }
+            source.audioDevice = audio
+            source.pictureMode = CameraPictureMode.available(for: device).first { $0.identifier == source.pictureMode?.identifier }
+            source.preparing = true
+            controller.start(device: device, format: source.pictureMode?.format) { [weak self, weak source] error in
+                guard let self, let source else { return }
+                source.preparing = false
+                guard source.requested else { self.releaseRecordingMedia(source); return }
+                if let error { self.scheduleRecordingRetry(source, error: error) } else { begin() }
+            }
+        } else { begin() }
+    }
+
     private func stopCurrentRecording(error: String? = nil) { if let source = recordingSource { stopRecording(source, error: error) } }
 
-    private func stopRecording(_ source: CameraRecordingSource, rotating: Bool = false, error: String? = nil) {
+    private func stopRecording(_ source: CameraRecordingSource, rotating: Bool = false, error: String? = nil, recovering: Bool = false) {
         guard source.isActive else { return }
-        if !rotating { source.requested = false; source.rotating = false; source.freezeClock() }
+        if recovering && source.requested { source.recovering = true; source.rotating = false; source.freezeClock() }
+        else if !rotating { source.cancelledWhileRecovering = source.recovering && source.segmentStartedAt == nil; source.requested = false; source.rotating = false; source.recovering = false; source.retryAt = nil; source.freezeClock() }
         else { source.rotating = true }
         if let error { source.failure = error }
         if source.finishing { return }
+        if !source.busy && !source.preparing {
+            if source.requested && source.recovering { scheduleRecordingRetry(source, error: error) }
+            else { source.status = "已停止"; releaseRecordingMedia(source); updateRecordingControls() }
+            return
+        }
         if source.preparing && !source.busy {
             source.preparing = false; source.status = "已取消"; releaseRecordingMedia(source); updateRecordingControls(); return
         }
@@ -1039,15 +1117,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let network = source.network, let identity = source.identity, !source.connected else { return }
         source.connected = true
         let recorder = source.recorder
-        network.onSampleBuffer = { sample in recorder.appendVideo(sample) }
-        network.onAudioSampleBuffer = { sample in recorder.appendAudio(sample) }
+        let sourceID = source.id, mirrored = source.mirrored
+        network.onSampleBuffer = { [weak self] sample in recorder.appendVideo(sample); self?.remoteMedia.video(sample, sourceID: sourceID, mirrored: mirrored) }
+        network.onAudioSampleBuffer = { [weak self] sample in recorder.appendAudio(sample); self?.remoteMedia.audio(sample, sourceID: sourceID) }
         network.onFrame = { [weak self, weak source] _, _, _ in
             guard let self, let source, self.recordingSources[source.id] === source else { return }
             source.lastVideoAt = Date()
         }
         let fail: (String) -> Void = { [weak self, weak source] message in
-            guard let self, let source, self.recordingSources[source.id] === source, source.isActive else { return }
-            self.stopRecording(source, error: message)
+            guard let self, let source, self.recordingSources[source.id] === source, source.requested else { return }
+            self.stopRecording(source, error: message, recovering: true)
         }
         network.onError = fail
         network.onAudioError = fail
@@ -1056,7 +1135,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func releaseRecordingMedia(_ source: CameraRecordingSource) {
         source.network?.stop()
-        if let controller = source.camera, controller !== camera || selectedNetworkModule != nil { controller.stop() }
+        source.connected = false
+        if let controller = source.camera, controller !== camera || selectedNetworkModule != nil {
+            if remoteViewers.contains(source.id) { remoteCameras[source.id] = controller } else { controller.stop() }
+        }
+        refreshRemoteFeeds()
     }
 
     private func beginRecording(to target: URL, source: CameraRecordingSource) {
@@ -1091,12 +1174,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case .recording:
             source.segmentStartedAt = Date()
             source.startedAnySegment = true
-            if source.requested && source.sessionStartedUptime == nil { source.sessionStartedUptime = ProcessInfo.processInfo.systemUptime }
+            if source.requested && source.sessionStartedUptime == nil { source.sessionStartedUptime = ProcessInfo.processInfo.systemUptime - source.frozenElapsed }
+            source.recovering = false; source.retryAt = nil; source.retryAttempt = 0; source.lastError = nil
         case .finishing:
             source.finishing = true; source.segmentStartedAt = nil
             if !source.requested { source.freezeClock() }
         case .finished(let url, let error):
-            let cancelled = !source.requested && !source.startedAnySegment && source.failure == nil && url == nil
+            if source.requested && (error?.hasPrefix("摄像头声音已中断") == true || (source.camera != nil && (source.audioDevice?.isConnected == false || !cameraDevices().contains(where: { "usb:" + $0.uniqueID == source.id })))) {
+                source.recovering = true; source.failure = error; source.freezeClock()
+            }
+            let cancelled = !source.requested && url == nil && (source.cancelledWhileRecovering || (!source.startedAnySegment && source.failure == nil))
             source.busy = false; source.preparing = false; source.finishing = false; source.segmentStartedAt = nil
             var completionError = cancelled ? nil : error ?? source.failure
             if let url {
@@ -1104,6 +1191,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 lastRecording = url; savedRecordings += 1
                 do { try library.add(url, sourceID: source.id, sourceName: source.name, startedAt: source.segmentDate) }
                 catch { completionError = error.localizedDescription }
+            }
+            if source.recovering && source.requested && !pendingTermination && (completionError == source.failure || completionError == nil) {
+                scheduleRecordingRetry(source, error: completionError)
+                refreshPlayback(); return
             }
             if source.rotating && source.requested && !pendingTermination && completionError == nil {
                 source.rotating = false
@@ -1113,6 +1204,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 return
             }
             source.rotating = false; source.requested = false; source.freezeClock()
+            source.recovering = false; source.retryAt = nil
             source.lastError = completionError
             source.status = url != nil ? "已保存" : (cancelled ? "已取消" : "保存失败")
             releaseRecordingMedia(source)
@@ -1143,8 +1235,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        if !activeRecordingSources.isEmpty { NSApp.terminate(nil); return false }
-        return true
+        hideMainWindow()
+        return false
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -1837,6 +1929,276 @@ extension AppDelegate {
     }
 }
 
+
+extension AppDelegate {
+    private func buildTray() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem?.button?.image = NSImage(systemSymbolName: "video", accessibilityDescription: "WireCamera")
+        statusItem?.button?.toolTip = "WireCamera"
+        trayMenu.delegate = self
+        statusItem?.menu = trayMenu
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === trayMenu else { return }
+        menu.removeAllItems()
+        menu.addItem(withTitle: "打开 WireCamera", action: #selector(showMainWindow), keyEquivalent: "")
+        menu.addItem(withTitle: "iPhone 连接…", action: #selector(showRemoteAccess), keyEquivalent: "")
+        if !activeRecordingSources.isEmpty {
+            menu.addItem(.separator())
+            for source in activeRecordingSources.sorted(by: { $0.name < $1.name }) {
+                let item = menu.addItem(withTitle: source.name + " · " + (source.recovering ? "等待重连" : source.elapsedText), action: nil, keyEquivalent: "")
+                item.isEnabled = false
+            }
+        }
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "退出 WireCamera", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    }
+
+    @objc private func hideMainWindow() { window.orderOut(nil); suspendPreview() }
+
+    private func suspendPreview() {
+        guard !previewSuspended else { return }
+        previewSuspended = true
+        moduleNetwork.stop()
+        camera.setVolume(0)
+        if sourceForCamera(camera) == nil && !remoteCameras.values.contains(where: { $0 === camera }) { camera.stop() }
+        preview.reset()
+    }
+
+    @objc private func showMainWindow() {
+        window.deminiaturize(nil)
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        resumePreview()
+    }
+
+    private func resumePreview() {
+        guard previewSuspended else { return }
+        previewSuspended = false
+        if let module = selectedNetworkModule { beginModuleConnection(CameraModuleIdentity(deviceID: module.deviceID, salt: "", address: module.address)) }
+        else if let device = cameraDevices().first(where: { $0.uniqueID == selectedID }) { startCamera(device) }
+    }
+
+    func windowWillMiniaturize(_ notification: Notification) { suspendPreview() }
+    func windowDidDeminiaturize(_ notification: Notification) { resumePreview() }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showMainWindow(); return true }
+
+    private func runBackgroundE2E(directory: URL) {
+        var phase = 0
+        let testTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { timer in
+            guard let source = self.recordingSource, source.requested else { return }
+            if phase == 0 {
+                guard source.segmentStartedAt != nil else { return }
+                self.window.performClose(nil); phase = 1
+            } else if phase == 1 {
+                guard source.savedCount >= 1 else { return }
+                let report: [String: Any] = ["hidden": !self.window.isVisible && self.previewSuspended, "recording": source.requested, "savedCount": source.savedCount]
+                try? JSONSerialization.data(withJSONObject: report).write(to: directory.appendingPathComponent("background-state.json"))
+                phase = 2
+            } else if FileManager.default.fileExists(atPath: directory.appendingPathComponent("reopen-request").path) {
+                self.showMainWindow()
+                let report: [String: Any] = ["visible": self.window.isVisible && !self.previewSuspended, "recording": source.requested]
+                try? JSONSerialization.data(withJSONObject: report).write(to: directory.appendingPathComponent("reopened-state.json"))
+                timer.invalidate()
+            }
+        }
+        RunLoop.main.add(testTimer, forMode: .common)
+    }
+
+    private func runRecordingRecoveryE2E() {
+        guard let directory = libraryTestDirectory, let index = CommandLine.arguments.firstIndex(of: "--fixture-address") else { return }
+        let first = "fixture-manual-device", second = "fixture-preview-device"
+        let firstID = "wifi:" + first, secondID = "wifi:" + second
+        let outage = directory.appendingPathComponent("second-offline")
+        let started = Date()
+        var phase = 0
+        var changedAt = Date()
+        var frozen: Double = 0
+        var firstCount = 0
+        var stoppedCount = 0
+        var checks: [[String: Any]] = []
+        func check(_ name: String, _ passed: Bool) { checks.append(["name": name, "passed": passed]) }
+        func choose(_ id: String) { self.picker.selectItem(withTitle: "Wi-Fi · " + id); self.picker.sendAction(self.picker.action, to: self.picker.target) }
+        func finish(_ error: String? = nil) {
+            let report: [String: Any] = ["passed": error == nil && checks.allSatisfy { $0["passed"] as? Bool == true }, "error": error ?? "", "checks": checks, "firstCameraFiles": self.library.entries.filter { $0.sourceID == firstID }.count, "secondCameraFiles": self.library.entries.filter { $0.sourceID == secondID }.count]
+            try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]).write(to: directory.appendingPathComponent("app-result.json"))
+        }
+        beginModuleConnection(CameraModuleIdentity(deviceID: first, salt: "", address: CommandLine.arguments[index + 1]))
+        let testTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { timer in
+            let a = self.recordingSources[firstID], b = self.recordingSources[secondID]
+            if Date().timeIntervalSince(started) > 75 || a?.lastError != nil { timer.invalidate(); finish(a?.lastError ?? "Timed out at phase \(phase)"); NSApp.terminate(nil); return }
+            switch phase {
+            case 0:
+                guard self.recordButton.isEnabled, Date().timeIntervalSince(self.lastNetworkAudioAt) < 2 else { return }
+                self.recordButton.performClick(nil); phase = 1
+            case 1:
+                guard a?.segmentStartedAt != nil else { return }
+                choose(second); phase = 2
+            case 2:
+                guard !self.awaitingFrames, Date().timeIntervalSince(self.lastNetworkAudioAt) < 2 else { return }
+                self.recordButton.performClick(nil); phase = 3
+            case 3:
+                guard b?.segmentStartedAt != nil, (a?.savedCount ?? 0) >= 1 else { return }
+                try? Data().write(to: outage)
+                changedAt = Date(); choose(first); phase = 4
+            case 4:
+                guard let b, !b.busy, !b.finishing, b.lastError != nil else { return }
+                check("power_loss_preserves_recording_intent", b.requested)
+                if !b.requested { timer.invalidate(); finish("Recording intent was cleared on power loss"); NSApp.terminate(nil); return }
+                frozen = b.elapsedSeconds; firstCount = a?.savedCount ?? 0; phase = 5
+            case 5:
+                guard Date().timeIntervalSince(changedAt) > 5 else { return }
+                check("outage_does_not_count_as_recording_time", abs((b?.elapsedSeconds ?? -10) - frozen) < 0.5)
+                check("other_camera_records_during_outage", (a?.savedCount ?? 0) > firstCount)
+                try? FileManager.default.removeItem(at: outage)
+                phase = 6
+            case 6:
+                guard let b, b.segmentStartedAt != nil, b.savedCount >= 2 else { return }
+                check("power_restoration_resumes_automatically", b.requested && b.lastError == nil)
+                check("recovery_keeps_cumulative_clock", b.elapsedSeconds >= frozen)
+                self.saveExperienceScreenshot(directory.appendingPathComponent("recovered-recording.png"))
+                try? Data().write(to: outage)
+                choose(second); phase = 7
+            case 7:
+                guard let b, !b.busy, !b.finishing, b.lastError != nil else { return }
+                check("stop_remains_available_while_offline", self.recordButton.title == "停止录制" && self.recordButton.isEnabled)
+                self.recordButton.performClick(nil)
+                stoppedCount = b.savedCount; changedAt = Date()
+                try? FileManager.default.removeItem(at: outage)
+                phase = 8
+            default:
+                guard Date().timeIntervalSince(changedAt) > 6 else { return }
+                check("manual_stop_cancels_automatic_recovery", b?.isActive == false && b?.savedCount == stoppedCount)
+                check("other_camera_still_records", a?.requested == true)
+                self.terminationTestCompletion = { errors in check("quit_cancels_retries_and_saves_tail", errors.isEmpty); finish(errors.isEmpty ? nil : errors.joined(separator: "\n")) }
+                timer.invalidate(); NSApp.terminate(nil)
+            }
+        }
+        RunLoop.main.add(testTimer, forMode: .common)
+    }
+}
+
+extension AppDelegate {
+    @objc private func showRemoteAccess() { remotePanel.show(settings: remoteIdentity.settings, status: remoteState) }
+
+    private func configureRemoteAccess() {
+        remoteMedia.onPacket = { [weak self] data, kind, sourceID in self?.remoteServer.publish(data, kind: kind, sourceID: sourceID) }
+        remoteServer.onCameras = { [weak self] in self?.remoteDevices() ?? [] }
+        remoteServer.onRecordings = { [weak self] in self?.library.entries ?? [] }
+        remoteServer.onMovieURL = { [weak self] entry in
+            guard let self else { return nil }
+            let movie = self.library.movieURL(entry).resolvingSymlinksInPath()
+            guard movie.deletingLastPathComponent() == self.library.directory.resolvingSymlinksInPath() else { return nil }
+            return movie
+        }
+        remoteServer.onViewersChanged = { [weak self] sources in
+            guard let self else { return }
+            self.remoteViewers = sources
+            self.remoteMedia.setViewers(sources)
+            self.refreshRemoteFeeds()
+        }
+        remoteServer.onState = { [weak self] message in self?.remoteState = message }
+        remotePanel.onChange = { [weak self] settings in
+            guard let self else { return }
+            do {
+                try self.remoteIdentity.save(settings)
+                self.remoteServer.stop()
+                if settings.enabled { self.startRemoteAccess(showPanel: true) }
+                else { self.remoteState = "手机连接已关闭。"; self.showRemoteAccess() }
+            } catch { self.remoteState = error.localizedDescription; self.showRemoteAccess() }
+        }
+        if CommandLine.arguments.contains("--remote-server-test") {
+            window.title = "WireCamera Test"
+            var settings = remoteIdentity.settings
+            settings.enabled = true; settings.port = 0
+            do { try remoteIdentity.save(settings) } catch { NSLog("Remote test setup failed: %@", error.localizedDescription); return }
+        }
+        if CommandLine.arguments.contains("--enable-remote") {
+            var settings = remoteIdentity.settings
+            settings.enabled = true
+            do { try remoteIdentity.save(settings) } catch { remoteState = error.localizedDescription; return }
+        }
+        if remoteIdentity.settings.enabled { startRemoteAccess() }
+    }
+
+    private func startRemoteAccess(showPanel: Bool = false) {
+        do {
+            try remoteServer.start(identity: remoteIdentity) { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success(let port):
+                    self.remoteState = "已开启加密连接。手机与 Mac 连接同一局域网后，扫描二维码或输入地址与密码。"
+                    if let index = CommandLine.arguments.firstIndex(of: "--remote-server-test"), CommandLine.arguments.indices.contains(index + 1) {
+                        let report: [String: Any] = ["port": port, "password": self.remoteIdentity.settings.password, "fingerprint": self.remoteIdentity.fingerprint]
+                        try? JSONSerialization.data(withJSONObject: report).write(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]).appendingPathComponent("server-ready.json"))
+                        if CommandLine.arguments.contains("--verify-background") { self.runBackgroundE2E(directory: URL(fileURLWithPath: CommandLine.arguments[index + 1])) }
+                    }
+                case .failure(let error): self.remoteState = "连接服务未能开启：" + error.localizedDescription
+                }
+                if showPanel { self.showRemoteAccess() }
+            }
+        } catch { remoteState = error.localizedDescription; NSLog("Remote service setup failed: %@", error.localizedDescription); if showPanel { showRemoteAccess() } }
+    }
+
+    private func remoteDevices() -> [CameraRemoteDevice] {
+        var values: [String: CameraRemoteDevice] = [:]
+        for entry in library.entries { values[entry.sourceID] = CameraRemoteDevice(id: entry.sourceID, name: entry.sourceName, online: false, recording: false) }
+        for module in networkModules {
+            let id = "wifi:" + module.deviceID
+            values[id] = CameraRemoteDevice(id: id, name: "Wi-Fi · " + module.deviceID, online: true, recording: recordingSources[id]?.isActive ?? false)
+        }
+        for device in cameraDevices() {
+            let id = "usb:" + device.uniqueID
+            values[id] = CameraRemoteDevice(id: id, name: device.localizedName, online: true, recording: recordingSources[id]?.isActive ?? false)
+        }
+        return values.values.sorted { $0.id < $1.id }
+    }
+
+    private func refreshRemoteFeeds() {
+        for id in Array(remoteNetworks.keys) where !remoteViewers.contains(id) || recordingSources[id]?.isActive == true {
+            remoteNetworks.removeValue(forKey: id)?.stop()
+        }
+        for id in Array(remoteCameras.keys) where !remoteViewers.contains(id) {
+            guard let controller = remoteCameras.removeValue(forKey: id) else { continue }
+            controller.setForwardingAudio(nil)
+            if controller !== camera, sourceForCamera(controller) == nil { controller.stop() }
+        }
+        for id in remoteViewers where id.hasPrefix("wifi:") && remoteNetworks[id] == nil && recordingSources[id]?.isActive != true {
+            guard let module = networkModules.first(where: { "wifi:" + $0.deviceID == id }) else { continue }
+            let network = CameraModuleNetwork()
+            remoteNetworks[id] = network
+            network.onSampleBuffer = { [weak self] sample in self?.remoteMedia.video(sample, sourceID: id, mirrored: false) }
+            network.onAudioSampleBuffer = { [weak self] sample in self?.remoteMedia.audio(sample, sourceID: id) }
+            network.onError = { [weak self, weak network] message in
+                guard let self, let network, self.remoteNetworks[id] === network else { return }
+                self.remoteServer.publish(Data(message.utf8), kind: 3, sourceID: id)
+            }
+            network.connect(identity: CameraModuleIdentity(deviceID: module.deviceID, salt: "", address: module.address)) { [weak self] result in
+                if case .failure(let error) = result { self?.remoteServer.publish(Data(error.localizedDescription.utf8), kind: 3, sourceID: id) }
+            }
+        }
+        for id in remoteViewers where id.hasPrefix("usb:") && remoteCameras[id] == nil {
+            guard let device = cameraDevices().first(where: { "usb:" + $0.uniqueID == id }) else { continue }
+            if AVCaptureDevice.authorizationStatus(for: .video) == .notDetermined {
+                if !remoteVideoPermissionPending {
+                    remoteVideoPermissionPending = true
+                    AVCaptureDevice.requestAccess(for: .video) { [weak self] _ in DispatchQueue.main.async { self?.remoteVideoPermissionPending = false; self?.refreshRemoteFeeds() } }
+                }
+                continue
+            }
+            guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { remoteServer.publish(Data("请在 Mac 的系统设置中允许 WireCamera 访问摄像头，再重新连接。".utf8), kind: 3, sourceID: id); continue }
+            let existing = recordingSources[id]?.isActive == true ? recordingSources[id]?.camera : (camera.deviceID == device.uniqueID && selectedNetworkModule == nil && !previewSuspended ? camera : nil)
+            let controller = existing ?? CameraController()
+            remoteCameras[id] = controller
+            if existing == nil { bindCamera(controller); controller.start(device: device, format: CameraPictureMode.available(for: device).first?.format) { [weak self] error in if let error { self?.remoteServer.publish(Data(error.utf8), kind: 3, sourceID: id) } } }
+            audioPermission { [weak self, weak controller] allowed in
+                guard self?.remoteViewers.contains(id) == true else { return }
+                if allowed { controller?.setForwardingAudio(cameraAudioDevice(for: device)) }
+            }
+        }
+    }
+}
 
 extension AppDelegate {
     private func runMultiRecordingE2E() {

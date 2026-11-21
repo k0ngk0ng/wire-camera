@@ -8,13 +8,15 @@ enum RecordingEvent {
     case finished(URL?, String?)
 }
 
-final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureFileOutputRecordingDelegate {
+final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, AVCaptureFileOutputRecordingDelegate {
     let session = AVCaptureSession()
     private let queue = DispatchQueue(label: "camera.session")
     private let frameQueue = DispatchQueue(label: "camera.frames")
     private let movie = AVCaptureMovieFileOutput()
     private var audioInput: AVCaptureDeviceInput?
     private var audioPreview: AVCaptureAudioPreviewOutput?
+    private var audioFrames: AVCaptureAudioDataOutput?
+    private var forwardedAudioDevice: AVCaptureDevice?
     private var monitoring = false
     private var volume: Float = 0.25
     private var destination: URL?
@@ -26,6 +28,8 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
     private var requestedFormat: AVCaptureDevice.Format?
     var onFrame: ((Int32, Int32, Double) -> Void)?
     var onSampleBuffer: ((CMSampleBuffer) -> Void)?
+    var onAudioSampleBuffer: ((CMSampleBuffer) -> Void)?
+    private(set) var deviceID: String?
     var onRecording: ((RecordingEvent) -> Void)?
     var onError: ((String) -> Void)?
     private var runtimeObserver: NSObjectProtocol?
@@ -49,6 +53,7 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     func start(device: AVCaptureDevice, format: AVCaptureDevice.Format? = nil, completion: @escaping (String?) -> Void) {
+        deviceID = device.uniqueID
         queue.async {
             guard self.destination == nil else {
                 DispatchQueue.main.async { completion("请先停止录制。") }
@@ -60,6 +65,7 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
             self.session.outputs.forEach { self.session.removeOutput($0) }
             self.audioInput = nil
             self.audioPreview = nil
+            self.audioFrames = nil
             self.monitoring = false
             self.videoDevice = device
             self.requestedFormat = format
@@ -122,7 +128,8 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
         NSLog("Native camera format: %d x %d", actual.width, actual.height)
     }
 
-    private func configureAudio(_ device: AVCaptureDevice?) throws {
+    private func configureAudio(_ requestedDevice: AVCaptureDevice?) throws {
+        let device = requestedDevice ?? forwardedAudioDevice
         session.beginConfiguration()
         defer { session.commitConfiguration() }
         if audioInput?.device.uniqueID != device?.uniqueID {
@@ -146,6 +153,16 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
             audioPreview = nil
         }
         audioPreview?.volume = monitoring ? volume : 0
+        if device != nil && audioFrames == nil {
+            let frames = AVCaptureAudioDataOutput()
+            frames.setSampleBufferDelegate(self, queue: frameQueue)
+            guard session.canAddOutput(frames) else { throw failure("无法转发摄像头声音。") }
+            session.addOutput(frames)
+            audioFrames = frames
+        } else if device == nil, let frames = audioFrames {
+            session.removeOutput(frames)
+            audioFrames = nil
+        }
     }
 
     func setMonitoring(_ device: AVCaptureDevice?, volume: Float, completion: @escaping (String?) -> Void) {
@@ -172,6 +189,13 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
         queue.async {
             self.volume = volume
             self.audioPreview?.volume = self.monitoring ? volume : 0
+        }
+    }
+
+    func setForwardingAudio(_ device: AVCaptureDevice?) {
+        queue.async {
+            self.forwardedAudioDevice = device
+            if self.destination == nil { try? self.configureAudio(self.monitoring ? self.audioInput?.device : nil) }
         }
     }
 
@@ -289,6 +313,7 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        if output is AVCaptureAudioDataOutput { onAudioSampleBuffer?(sampleBuffer); return }
         guard let format = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
         onSampleBuffer?(sampleBuffer)
         let size = CMVideoFormatDescriptionGetDimensions(format)

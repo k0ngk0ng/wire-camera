@@ -49,10 +49,11 @@ struct CameraModuleManualFixture {
         var secondCamera = false
         var dropSecond = false
         var streamJPEG = jpeg
-        let deadline = Date().addingTimeInterval(90)
+        let deadline = Date().addingTimeInterval(CommandLine.arguments.contains("--long-lived") ? 600 : 90)
         var nextFrame = Date()
         do {
             while Date() < deadline {
+                if secondCamera && CommandLine.arguments.contains("--controlled-outage") && FileManager.default.fileExists(atPath: URL(fileURLWithPath: CommandLine.arguments[2]).appendingPathComponent("second-offline").path) { return }
                 if dropSecond && sequence > 25 { return }
                 var event = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
                 if poll(&event, 1, 30) > 0 {

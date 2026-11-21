@@ -6,8 +6,8 @@ final class CameraRecordingSource {
     let name: String
     let mirrored: Bool
     let camera: CameraController?
-    let audioDevice: AVCaptureDevice?
-    let pictureMode: CameraPictureMode?
+    var audioDevice: AVCaptureDevice?
+    var pictureMode: CameraPictureMode?
     let identity: CameraModuleIdentity?
     let network: CameraModuleNetwork?
     var connected = false
@@ -19,6 +19,10 @@ final class CameraRecordingSource {
     var preparing = false
     var finishing = false
     var rotating = false
+    var recovering = false
+    var retryAt: Date?
+    var retryAttempt = 0
+    var cancelledWhileRecovering = false
     var segmentStartedAt: Date?
     var segmentDate = Date()
     var sessionStartedUptime: TimeInterval?

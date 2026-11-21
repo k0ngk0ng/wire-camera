@@ -3,3 +3,5 @@
 dist/
 *.app/
 .DS_Store
+**/xcuserdata/
+**/project.xcworkspace/

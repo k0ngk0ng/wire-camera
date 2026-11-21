@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key><string>WireCamera</string>
+    <key>NSLocalNetworkUsageDescription</key><string>连接局域网中的 Mac，查看摄像头实时画面和已保存的录像。</string>
+    <key>NSCameraUsageDescription</key><string>扫描 Mac 上的 WireCamera 配对二维码。</string>
+    <key>NSBonjourServices</key><array><string>_wirecamera._tcp</string></array>
+    <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
+    <key>CFBundleURLTypes</key><array><dict><key>CFBundleURLName</key><string>com.wirecamera.iphone.pair</string><key>CFBundleURLSchemes</key><array><string>wirecamera</string></array></dict></array>
+    <key>UILaunchScreen</key><dict/>
+    <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+    <key>ITSAppUsesNonExemptEncryption</key><false/>
+</dict>
+</plist>

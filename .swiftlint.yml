@@ -2,10 +2,13 @@ included:
   - Sources
   - Tests
   - scripts
+  - Shared
+  - iOS
 excluded:
   - .build
   - .local
   - WireCamera.app
+  - iOS/WireCamera.xcodeproj
 only_rules:
   - type_name
   - identifier_name

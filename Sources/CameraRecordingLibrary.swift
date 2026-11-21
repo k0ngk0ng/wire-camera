@@ -2,23 +2,6 @@ import AVFoundation
 import Foundation
 import Vision
 
-struct CameraPersonEvent: Codable {
-    var start: Double
-    var end: Double
-}
-
-struct CameraRecording: Codable {
-    let id: String
-    let sourceID: String
-    let sourceName: String
-    let startedAt: Date
-    let duration: Double
-    var events: [CameraPersonEvent]
-    var indexState: String
-
-    var filename: String { id + ".mov" }
-}
-
 final class CameraRecordingLibrary {
     let directory: URL
     private(set) var entries: [CameraRecording] = []

@@ -11,9 +11,9 @@ xcrun swiftc -swift-version 5 -module-cache-path "$CLANG_MODULE_CACHE_PATH" -fra
   Sources/CameraModuleProtocol.swift Sources/CameraModuleNetwork.swift Sources/CameraModuleVideoSampler.swift Sources/CameraModuleAudioSampler.swift Tests/CameraModuleManualFixture.swift -o "$RUN_DIR/fixture"
 FIXTURE_ARGUMENTS=(--audio --multi-camera --keep-second-online)
 APPLICATION_ARGUMENTS=()
-if [[ "${WIRECAMERA_MULTI_DROP:-0}" == 1 ]]; then
-  FIXTURE_ARGUMENTS=(--audio --multi-camera --recover-second)
-  APPLICATION_ARGUMENTS+=(--expect-second-drop)
+if [[ "${WIRECAMERA_MULTI_DROP:-0}" == 1 || "${WIRECAMERA_RECOVERY:-0}" == 1 ]]; then
+  FIXTURE_ARGUMENTS=(--audio --multi-camera --keep-second-online --controlled-outage)
+  APPLICATION_ARGUMENTS+=(--recording-recovery-e2e)
 fi
 "$RUN_DIR/fixture" "$FIXTURE_ADDRESS" "$RUN_DIR" "$PWD/Tests/Fixtures/person-frame.jpg" "${FIXTURE_ARGUMENTS[@]}" > "$RUN_DIR/fixture.log" 2>&1 &
 FIXTURE_PID=$!
