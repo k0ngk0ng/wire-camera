@@ -85,7 +85,7 @@ final class CameraNetworkRecorder {
         }
     }
 
-    func stop() { queue.async { self.finish(error: nil) } }
+    func stop(error: String? = nil) { queue.async { self.finish(error: error) } }
 
     private func finish(error: String?) {
         guard let target, let staging else { return }

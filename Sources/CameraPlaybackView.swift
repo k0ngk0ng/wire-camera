@@ -5,9 +5,25 @@ private final class CameraPlaybackList: NSStackView {
     override var isFlipped: Bool { true }
 }
 
+private final class CameraPlaybackSurface: AVPlayerView {
+    var onSingleClick: (() -> Void)?
+    private var pressedAt: NSPoint?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { super.hitTest(point) == nil ? nil : self }
+    override func mouseDown(with event: NSEvent) { pressedAt = event.locationInWindow }
+    override func mouseUp(with event: NSEvent) {
+        defer { pressedAt = nil }
+        guard let pressedAt, event.clickCount == 1,
+              hypot(event.locationInWindow.x - pressedAt.x, event.locationInWindow.y - pressedAt.y) < 4,
+              bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
+        onSingleClick?()
+    }
+}
+
 final class CameraPlaybackView: NSView {
     let player = AVPlayer()
-    private let playerView = AVPlayerView()
+    private let playerView = CameraPlaybackSurface(frame: .zero)
     private let datePicker = NSPopUpButton()
     private let eventList = CameraPlaybackList()
     private let timeline = CameraDayTimeline(frame: .zero)
@@ -48,6 +64,7 @@ final class CameraPlaybackView: NSView {
         wantsLayer = true
         layer?.backgroundColor = NSColor(calibratedWhite: 0.06, alpha: 1).cgColor
         playerView.player = player
+        playerView.onSingleClick = { [weak self] in self?.togglePlayback() }
         playerView.controlsStyle = .none
         playerView.allowsVideoFrameAnalysis = false
         playerView.videoGravity = .resizeAspect

@@ -44,10 +44,13 @@ struct CameraModuleManualFixture {
         var playing = false
         var audioPlaying = false
         var sequence: UInt64 = 1
+        var secondCamera = false
+        var streamJPEG = jpeg
         let deadline = Date().addingTimeInterval(90)
         var nextFrame = Date()
         do {
             while Date() < deadline {
+                if secondCamera && sequence > 25 { return }
                 var event = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
                 if poll(&event, 1, 30) > 0 {
                     var bytes = [UInt8](repeating: 0, count: 4096)
@@ -58,7 +61,10 @@ struct CameraModuleManualFixture {
                         let body: Data
                         switch frame.command {
                         case 2650:
-                            guard try CameraModuleNetworkProtocol.protobufString(frame.body, field: 2) == "fixture-manual-device" else { return }
+                            let deviceID = try CameraModuleNetworkProtocol.protobufString(frame.body, field: 2)
+                            secondCamera = CommandLine.arguments.contains("--multi-camera") && deviceID == "fixture-preview-device"
+                            guard deviceID == "fixture-manual-device" || secondCamera else { return }
+                            if secondCamera { streamJPEG = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[3]).deletingLastPathComponent().appendingPathComponent("module-jpeg-frame.jpg")) }
                             body = CameraModuleNetworkProtocol.stringField(1, "fixture-session")
                         case 106: body = Data([8, 1])
                         case 2610:
@@ -79,7 +85,7 @@ struct CameraModuleManualFixture {
                     body.append(contentsOf: CameraModuleNetworkProtocol.varint(sequence))
                     body.append(contentsOf: CameraModuleNetworkProtocol.varint(UInt64(Date().timeIntervalSince1970 * 1000)))
                     body.append(0)
-                    body.append(jpeg)
+                    body.append(streamJPEG)
                     let packet = Data([0x68]) + Data(CameraModuleNetworkProtocol.varint(UInt64(body.count))) + body
                     try sendAll(packet, to: descriptor)
                     if audioPlaying && (!CommandLine.arguments.contains("--audio-drop") || sequence < 12) {
@@ -87,7 +93,7 @@ struct CameraModuleManualFixture {
                         audioBody.append(contentsOf: CameraModuleNetworkProtocol.varint(sequence))
                         audioBody.append(contentsOf: CameraModuleNetworkProtocol.varint(UInt64(Date().timeIntervalSince1970 * 1000)))
                         audioBody.append(0)
-                        let tone: [UInt8] = [0xd5, 0x87, 0x96, 0xba, 0x9a, 0x85, 0xe3, 0x60, 0x04, 0x1b, 0x3a, 0x16, 0x07, 0x55, 0xd5, 0xd5]
+                        let tone: [UInt8] = secondCamera ? [0xd5, 0xa0, 0x92, 0xa0, 0x55, 0x20, 0x12, 0x20] : [0xd5, 0x87, 0x96, 0xba, 0x9a, 0x85, 0xe3, 0x60, 0x04, 0x1b, 0x3a, 0x16, 0x07, 0x55, 0xd5, 0xd5]
                         audioBody.append(contentsOf: (0..<800).map { tone[$0 % tone.count] })
                         try sendAll(Data([0x68]) + Data(CameraModuleNetworkProtocol.varint(UInt64(audioBody.count))) + audioBody, to: descriptor)
                     }
@@ -118,7 +124,12 @@ struct CameraModuleManualFixture {
                     pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { recvfrom(udp, &bytes, bytes.count, 0, $0, &size) }
                 }
                 if count > 0 {
-                    let body = CameraModuleNetworkProtocol.stringField(1, "fixture-manual-device") + Data([32, 0xde, 0x9d, 1]) + CameraModuleNetworkProtocol.stringField(8, "$Lfixture-sign")
+                    let request = Data(bytes.prefix(count))
+                    let binary = try? CameraModuleNetworkProtocol.decode(request)
+                    let json = (try? JSONSerialization.jsonObject(with: request)) as? [String: String]
+                    let requested = binary.flatMap { try? CameraModuleNetworkProtocol.protobufString($0.body, field: 1) } ?? json?["did"]
+                    let deviceID = CommandLine.arguments.contains("--multi-camera") && requested == "fixture-preview-device" ? "fixture-preview-device" : "fixture-manual-device"
+                    let body = CameraModuleNetworkProtocol.stringField(1, deviceID) + Data([32, 0xde, 0x9d, 1]) + CameraModuleNetworkProtocol.stringField(8, "$Lfixture-sign")
                     let response = try CameraModuleNetworkProtocol.encode(command: 2600, sequence: 1, body: body, rpc: 1, udp: true)
                     response.withUnsafeBytes { data in
                         withUnsafePointer(to: &source) { pointer in

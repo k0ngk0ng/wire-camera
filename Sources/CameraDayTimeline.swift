@@ -140,8 +140,7 @@ final class CameraDayTimeline: NSControl {
             let left = max(16, x(for: interval.start)), right = min(bounds.width - 16, x(for: interval.end))
             guard right >= left, x(for: interval.end) >= 16, x(for: interval.start) <= bounds.width - 16 else { continue }
             NSColor.systemOrange.setFill()
-            NSRect(x: left, y: 43, width: max(3, right - left), height: 4).fill()
-            NSBezierPath(ovalIn: NSRect(x: left - 2, y: 48, width: 5, height: 5)).fill()
+            NSBezierPath(ovalIn: NSRect(x: left - 3, y: 45, width: 6, height: 6)).fill()
         }
         let desired = visibleDuration / max(1, Double(width / 90))
         let steps: [Double] = [5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800]
@@ -159,7 +158,7 @@ final class CameraDayTimeline: NSControl {
         }
         NSColor.white.setFill()
         let cursor = x(for: dayStart.addingTimeInterval(position))
-        if cursor >= 16 && cursor <= bounds.width - 16 { NSRect(x: cursor, y: 18, width: 2, height: 40).fill() }
+        if cursor >= 16 && cursor <= bounds.width - 16 { NSRect(x: cursor, y: 18, width: 2, height: 24).fill() }
         let legendAttributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.secondaryLabelColor]
         NSColor.controlAccentColor.setFill(); NSRect(x: 16, y: 63, width: 8, height: 5).fill()
         ("录像" as NSString).draw(at: NSPoint(x: 29, y: 58), withAttributes: legendAttributes)

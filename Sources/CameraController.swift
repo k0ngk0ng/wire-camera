@@ -27,6 +27,18 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
     var onFrame: ((Int32, Int32, Double) -> Void)?
     var onSampleBuffer: ((CMSampleBuffer) -> Void)?
     var onRecording: ((RecordingEvent) -> Void)?
+    var onError: ((String) -> Void)?
+    private var runtimeObserver: NSObjectProtocol?
+
+    override init() {
+        super.init()
+        runtimeObserver = NotificationCenter.default.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: .main) { [weak self] note in
+            let error = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
+            self?.onError?(error?.localizedDescription ?? "摄像头暂时不可用。")
+        }
+    }
+
+    deinit { if let runtimeObserver { NotificationCenter.default.removeObserver(runtimeObserver) } }
 
     private func failure(_ message: String) -> NSError {
         NSError(domain: "WireCamera", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
