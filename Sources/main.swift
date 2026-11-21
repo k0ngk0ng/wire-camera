@@ -1368,6 +1368,7 @@ extension AppDelegate {
         let verifyClock = CommandLine.arguments.contains("--verify-recording-clock")
         let verifyControls = CommandLine.arguments.contains("--verify-playback-controls")
         let verifyOffline = CommandLine.arguments.contains("--verify-offline-playback")
+        let verifyDayTimeline = CommandLine.arguments.contains("--verify-day-timeline")
         let offlineSourceID = "wifi:fixture-offline-archive"
         let offlineSourceName = "Wi-Fi · 离线摄像头"
         var offlineChecked = false
@@ -1436,6 +1437,72 @@ extension AppDelegate {
                 volume.sendAction(volume.action, to: volume.target)
                 check("bottom_volume_control", abs(self.playback.player.volume - 0.3) < 0.01 && !self.playback.player.isMuted)
             }
+        }
+        func checkDayTimeline(_ done: @escaping () -> Void) {
+            guard verifyDayTimeline else { done(); return }
+            do {
+                guard let original = self.library.entries.max(by: { $0.duration < $1.duration }) else { done(); return }
+                let start = Calendar.current.startOfDay(for: Date())
+                let noon = Calendar.current.date(bySettingHour: 12, minute: 0, second: 0, of: start)!
+                let source = "wifi:fixture-day-timeline"
+                let name = "Wi-Fi · 时间轴测试"
+                func copy(_ date: Date) throws -> CameraRecording {
+                    let entry = CameraRecording(id: UUID().uuidString, sourceID: source, sourceName: name, startedAt: date, duration: original.duration, events: original.events, indexState: "ready")
+                    try FileManager.default.copyItem(at: self.library.movieURL(original), to: self.library.movieURL(entry))
+                    try JSONEncoder().encode(entry).write(to: self.library.directory.appendingPathComponent(entry.id + ".json"), options: .atomic)
+                    return entry
+                }
+                let first = try copy(noon)
+                let second = try copy(noon.addingTimeInterval(first.duration))
+                let later = try copy(noon.addingTimeInterval(600))
+                _ = try copy(start.addingTimeInterval(-2))
+                self.library.reload()
+                if let picker = historyPicker() { picker.selectItem(withTitle: name); picker.sendAction(picker.action, to: picker.target) }
+                guard let axis = control("playback-progress") as? CameraDayTimeline else { check("day_timeline_available", false); done(); return }
+                self.window.contentView?.layoutSubtreeIfNeeded()
+                check("day_timeline_spans_view_width", axis.bounds.width >= self.playback.bounds.width * 0.9)
+                check("day_timeline_covers_local_day", axis.dayStart == start && axis.dayEnd == Calendar.current.date(byAdding: .day, value: 1, to: start))
+                func click(_ date: Date) {
+                    axis.zoom(to: 60, around: date)
+                    let point = axis.convert(NSPoint(x: axis.x(for: date), y: 36), to: nil)
+                    let event = NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: self.window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
+                    axis.mouseDown(with: event)
+                    axis.mouseUp(with: event)
+                }
+                func currentFile() -> String? { (self.playback.player.currentItem?.asset as? AVURLAsset)?.url.lastPathComponent }
+                click(first.startedAt.addingTimeInterval(1))
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    check("timeline_click_selects_first_file", currentFile() == first.filename)
+                    check("timeline_click_seeks_file_offset", abs(self.playback.player.currentTime().seconds - 1) < 1)
+                    click(second.startedAt.addingTimeInterval(0.5))
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                        check("timeline_click_selects_other_file", currentFile() == second.filename)
+                        click(noon.addingTimeInterval(100))
+                        check("timeline_gap_is_empty", self.playback.player.currentItem == nil)
+                        if let play = control("playback-play-pause") as? NSButton { play.performClick(nil) }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                            check("play_from_gap_finds_next_recording", currentFile() == later.filename)
+                            click(noon.addingTimeInterval(1200))
+                            if let play = control("playback-play-pause") as? NSButton { play.performClick(nil) }
+                            check("after_last_recording_does_not_rewind", self.playback.player.currentItem == nil)
+                            click(first.startedAt.addingTimeInterval(first.duration - 0.3))
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
+                                check("playback_automatically_advances_segment", currentFile() == second.filename)
+                                let position = axis.doubleValue
+                                if let zoom = control("playback-zoom") as? NSSegmentedControl { zoom.selectedSegment = 2; zoom.sendAction(zoom.action, to: zoom.target) }
+                                check("timeline_one_hour_zoom", abs(axis.visibleDuration - 3600) < 0.1)
+                                check("zoom_preserves_playback_position", abs(axis.doubleValue - position) < 0.1)
+                                if verifyPeople { check("person_markers_match_scene", !axis.personIntervals.isEmpty == expectsPeople) }
+                                self.saveExperienceScreenshot(directory.appendingPathComponent("day-timeline.png"))
+                                if let zoom = control("playback-zoom") as? NSSegmentedControl { zoom.selectedSegment = 0; zoom.sendAction(zoom.action, to: zoom.target) }
+                                check("timeline_full_day_zoom", abs(axis.visibleDuration - axis.dayEnd.timeIntervalSince(axis.dayStart)) < 0.1)
+                                self.saveExperienceScreenshot(directory.appendingPathComponent("day-timeline-full.png"))
+                                done()
+                            }
+                        }
+                    }
+                }
+            } catch { check("day_timeline_fixture", false); done() }
         }
         func finish(_ error: String? = nil) {
             let report: [String: Any] = ["passed": error == nil && checks.allSatisfy { $0["passed"] as? Bool == true }, "error": error ?? "", "checks": checks, "clockSamples": clockSamples]
@@ -1515,7 +1582,7 @@ extension AppDelegate {
                 phase = 2
             case 2:
                 if verifyOffline && !offlineChecked {
-                    guard !offlinePending, self.savedRecordings >= 1, let original = self.library.entries.first else { return }
+                    guard !offlinePending, self.savedRecordings >= 1, let original = self.library.entries.first, original.indexState == "ready" else { return }
                     offlinePending = true
                     do {
                         let id = UUID().uuidString
@@ -1578,12 +1645,14 @@ extension AppDelegate {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
                     check("video_playable", self.playback.player.currentItem?.status == .readyToPlay)
                     checkPlaybackControls()
-                    if expectsPeople && verifyPeople { check("event_button_seek", self.playback.performFirstEventJump()) }
-                    self.modePicker.selectedSegment = 0
-                    self.modePicker.sendAction(self.modePicker.action, to: self.modePicker.target)
-                    check("live_resumes", !self.preview.isHidden && Date().timeIntervalSince(self.lastFrameAt) < 3)
-                    self.saveExperienceScreenshot(directory.appendingPathComponent("live.png"))
-                    finish()
+                    checkDayTimeline {
+                        if expectsPeople && verifyPeople { check("event_button_seek", self.playback.performFirstEventJump()) }
+                        self.modePicker.selectedSegment = 0
+                        self.modePicker.sendAction(self.modePicker.action, to: self.modePicker.target)
+                        check("live_resumes", !self.preview.isHidden && Date().timeIntervalSince(self.lastFrameAt) < 3)
+                        self.saveExperienceScreenshot(directory.appendingPathComponent("live.png"))
+                        finish()
+                    }
                 }
             }
         }

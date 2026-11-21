@@ -67,7 +67,7 @@ final class CameraRecordingLibrary {
     }
 
     func resumeIndexing() {
-        for entry in entries where entry.indexState == "processing" { index(entry) }
+        for entry in entries where entry.indexState == "processing" || entry.indexState == "failed" { index(entry) }
     }
 
     func index(_ entry: CameraRecording) {
@@ -78,13 +78,17 @@ final class CameraRecordingLibrary {
         queue.async {
             var updated = entry
             do {
-                let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+                let asset = AVURLAsset(url: url)
+                guard let video = asset.tracks(withMediaType: .video).first else { throw self.failure("录像没有可分析的视频画面。") }
+                let analysisDuration = min(entry.duration, video.timeRange.end.seconds)
+                guard analysisDuration.isFinite, analysisDuration > 0 else { throw self.failure("录像的视频时长不正确。") }
+                let generator = AVAssetImageGenerator(asset: asset)
                 generator.appliesPreferredTrackTransform = true
                 generator.maximumSize = CGSize(width: 640, height: 640)
                 generator.requestedTimeToleranceBefore = CMTime(seconds: 0.3, preferredTimescale: 600)
                 generator.requestedTimeToleranceAfter = CMTime(seconds: 0.3, preferredTimescale: 600)
                 var detected: [Double] = []
-                for second in stride(from: 0.0, to: entry.duration, by: 1) {
+                for second in stride(from: 0.0, to: analysisDuration, by: 1) {
                     try autoreleasepool {
                         let image = try generator.copyCGImage(at: CMTime(seconds: second, preferredTimescale: 600), actualTime: nil)
                         let request = VNDetectHumanRectanglesRequest()
@@ -93,7 +97,7 @@ final class CameraRecordingLibrary {
                         if request.results?.contains(where: { $0.confidence >= 0.6 }) == true { detected.append(second) }
                     }
                 }
-                updated.events = Self.personEvents(times: detected, duration: entry.duration)
+                updated.events = Self.personEvents(times: detected, duration: analysisDuration)
                 updated.indexState = "ready"
             } catch { updated.indexState = "failed" }
             let result = updated

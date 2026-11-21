@@ -1,21 +1,6 @@
 import AppKit
 import AVKit
 
-final class CameraEventTimeline: NSSlider {
-    var events: [CameraPersonEvent] = []
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        guard maxValue > 0 else { return }
-        NSColor.systemOrange.withAlphaComponent(0.9).setFill()
-        for event in events {
-            let start = 8 + CGFloat(event.start / maxValue) * (bounds.width - 16)
-            let width = max(3, CGFloat((event.end - event.start) / maxValue) * (bounds.width - 16))
-            NSBezierPath(roundedRect: NSRect(x: start, y: 1, width: width, height: 4), xRadius: 2, yRadius: 2).fill()
-        }
-    }
-}
-
 private final class CameraPlaybackList: NSStackView {
     override var isFlipped: Bool { true }
 }
@@ -24,22 +9,24 @@ final class CameraPlaybackView: NSView {
     let player = AVPlayer()
     private let playerView = AVPlayerView()
     private let datePicker = NSPopUpButton()
-    private let recordings = CameraPlaybackList()
     private let eventList = CameraPlaybackList()
-    private let timeline = CameraEventTimeline(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
-    private let timeLabel = NSTextField(labelWithString: "00:00 / 00:00")
+    private let timeline = CameraDayTimeline(frame: .zero)
+    private let zoomPicker = NSSegmentedControl(labels: ["全天", "6 小时", "1 小时", "15 分钟"], trackingMode: .selectOne, target: nil, action: nil)
+    private let timeLabel = NSTextField(labelWithString: "00:00:00")
     private let playPause = NSButton()
     private let skipBackward = NSButton()
     private let skipForward = NSButton()
     private let mute = NSButton()
     private let fullscreen = NSButton()
+    private let panBackward = NSButton()
+    private let panForward = NSButton()
     private let playbackVolume = NSSlider(value: 1, minValue: 0, maxValue: 1, target: nil, action: nil)
     private let speedPicker = NSPopUpButton()
     private let playbackRates: [Float] = [0.5, 1, 1.5, 2, 4]
     private var playerStateObservation: NSKeyValueObservation?
     var onToggleFullscreen: (() -> Void)?
     private let empty = NSTextField(wrappingLabelWithString: "开启录制后，可在这里查看回放")
-    private let eventStatus = NSTextField(wrappingLabelWithString: "选择一段录像")
+    private let eventStatus = NSTextField(wrappingLabelWithString: "")
     private var library: CameraRecordingLibrary?
     private var sourceID: String?
     private var recordingActive = false
@@ -47,8 +34,14 @@ final class CameraPlaybackView: NSView {
     private var selected: CameraRecording?
     private var dates: [Date] = []
     private var day: Date?
+    private var schedule: CameraPlaybackDay?
+    private var cursor: Date?
+    private var seekGeneration = 0
+    private var seeking = false
+    private var wantsPlayback = false
     private var observer: Any?
-    var visibleRecordingCount: Int { recordings.arrangedSubviews.count }
+    private var endObserver: NSObjectProtocol?
+    var visibleRecordingCount: Int { visible.count }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -58,34 +51,39 @@ final class CameraPlaybackView: NSView {
         playerView.controlsStyle = .none
         playerView.allowsVideoFrameAnalysis = false
         playerView.videoGravity = .resizeAspect
-        let sidebar = NSView()
+        let toolbar = NSView()
         let eventsPanel = NSView()
         let transport = NSView()
-        let listTitle = Self.label("录像", size: 17, weight: .semibold)
-        let eventsTitle = Self.label("人物出现", size: 15, weight: .semibold)
+        let eventsTitle = NSTextField(labelWithString: "人物出现")
+        eventsTitle.font = .systemFont(ofSize: 15, weight: .semibold)
         datePicker.target = self
         datePicker.action = #selector(changeDate)
         datePicker.setAccessibilityLabel("回放日期")
-        recordings.orientation = .vertical
-        recordings.alignment = .leading
-        recordings.spacing = 8
+        zoomPicker.target = self
+        zoomPicker.action = #selector(changeZoom)
+        zoomPicker.selectedSegment = 0
+        zoomPicker.segmentStyle = .rounded
+        zoomPicker.setAccessibilityLabel("时间轴范围")
+        zoomPicker.setAccessibilityIdentifier("playback-zoom")
         eventList.orientation = .vertical
         eventList.alignment = .leading
         eventList.spacing = 8
-        let listScroll = Self.scroll(recordings)
-        let eventsScroll = Self.scroll(eventList)
+        let eventsScroll = NSScrollView()
+        eventsScroll.drawsBackground = false
+        eventsScroll.hasVerticalScroller = true
+        eventsScroll.documentView = eventList
+        eventList.translatesAutoresizingMaskIntoConstraints = false
         eventStatus.textColor = .secondaryLabelColor
         eventStatus.font = .systemFont(ofSize: 12)
         timeline.target = self
-        timeline.action = #selector(seek)
-        timeline.isContinuous = true
-        timeline.setAccessibilityLabel("回放时间轴")
-        timeline.setAccessibilityIdentifier("playback-progress")
+        timeline.action = #selector(seekTimeline)
         configure(playPause, symbol: "play.fill", label: "播放回放", action: #selector(togglePlayback), identifier: "playback-play-pause")
         configure(skipBackward, symbol: "gobackward.10", label: "后退 10 秒", action: #selector(skipBackwardTenSeconds), identifier: "playback-backward")
         configure(skipForward, symbol: "goforward.10", label: "前进 10 秒", action: #selector(skipForwardTenSeconds), identifier: "playback-forward")
         configure(mute, symbol: "speaker.wave.2.fill", label: "静音回放", action: #selector(toggleMute), identifier: "playback-mute")
         configure(fullscreen, symbol: "arrow.up.left.and.arrow.down.right", label: "切换全屏", action: #selector(toggleFullscreen), identifier: "playback-fullscreen")
+        configure(panBackward, symbol: "chevron.left", label: "前一时段", action: #selector(panEarlier), identifier: "playback-pan-earlier")
+        configure(panForward, symbol: "chevron.right", label: "后一时段", action: #selector(panLater), identifier: "playback-pan-later")
         playbackVolume.target = self
         playbackVolume.action = #selector(changePlaybackVolume)
         playbackVolume.isContinuous = true
@@ -102,155 +100,176 @@ final class CameraPlaybackView: NSView {
         let controls = NSStackView(views: [skipBackward, playPause, skipForward, timeLabel, spacer, mute, playbackVolume, speedPicker, fullscreen])
         controls.spacing = 8
         controls.alignment = .centerY
-        controls.translatesAutoresizingMaskIntoConstraints = false
-        transport.addSubview(controls)
-        timeLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        timeLabel.textColor = .secondaryLabelColor
+        timeLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        timeLabel.setAccessibilityLabel("播放时间")
         empty.alignment = .center
         empty.textColor = .secondaryLabelColor
         empty.font = .systemFont(ofSize: 15)
-        for view in [sidebar, playerView, eventsPanel, transport, empty] { view.translatesAutoresizingMaskIntoConstraints = false; addSubview(view) }
-        for view in [listTitle, datePicker, listScroll] { view.translatesAutoresizingMaskIntoConstraints = false; sidebar.addSubview(view) }
+        for view in [playerView, eventsPanel, transport, empty] { view.translatesAutoresizingMaskIntoConstraints = false; addSubview(view) }
+        toolbar.translatesAutoresizingMaskIntoConstraints = false
+        transport.addSubview(toolbar)
+        for view in [datePicker, zoomPicker, panBackward, panForward] { view.translatesAutoresizingMaskIntoConstraints = false; toolbar.addSubview(view) }
         for view in [eventsTitle, eventStatus, eventsScroll] { view.translatesAutoresizingMaskIntoConstraints = false; eventsPanel.addSubview(view) }
-        for view in [timeline] { view.translatesAutoresizingMaskIntoConstraints = false; transport.addSubview(view) }
+        for view in [timeline, controls] { view.translatesAutoresizingMaskIntoConstraints = false; transport.addSubview(view) }
         NSLayoutConstraint.activate([
-            sidebar.leadingAnchor.constraint(equalTo: leadingAnchor), sidebar.topAnchor.constraint(equalTo: topAnchor), sidebar.bottomAnchor.constraint(equalTo: bottomAnchor), sidebar.widthAnchor.constraint(equalToConstant: 220),
-            listTitle.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 24), listTitle.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 20),
-            datePicker.topAnchor.constraint(equalTo: listTitle.bottomAnchor, constant: 16), datePicker.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 16), datePicker.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -16),
-            listScroll.topAnchor.constraint(equalTo: datePicker.bottomAnchor, constant: 16), listScroll.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -16), listScroll.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 16), listScroll.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -16),
-            recordings.widthAnchor.constraint(equalTo: listScroll.widthAnchor, constant: -8),
-            eventsPanel.trailingAnchor.constraint(equalTo: trailingAnchor), eventsPanel.topAnchor.constraint(equalTo: topAnchor), eventsPanel.bottomAnchor.constraint(equalTo: bottomAnchor), eventsPanel.widthAnchor.constraint(equalToConstant: 190),
-            eventsTitle.topAnchor.constraint(equalTo: eventsPanel.topAnchor, constant: 24), eventsTitle.leadingAnchor.constraint(equalTo: eventsPanel.leadingAnchor, constant: 16),
-            eventStatus.topAnchor.constraint(equalTo: eventsTitle.bottomAnchor, constant: 16), eventStatus.leadingAnchor.constraint(equalTo: eventsTitle.leadingAnchor), eventStatus.trailingAnchor.constraint(equalTo: eventsPanel.trailingAnchor, constant: -16),
-            eventsScroll.topAnchor.constraint(equalTo: eventStatus.bottomAnchor, constant: 16), eventsScroll.leadingAnchor.constraint(equalTo: eventsTitle.leadingAnchor), eventsScroll.trailingAnchor.constraint(equalTo: eventsPanel.trailingAnchor, constant: -16), eventsScroll.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -16),
-            eventList.widthAnchor.constraint(equalTo: eventsScroll.widthAnchor, constant: -8),
-            playerView.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor), playerView.trailingAnchor.constraint(equalTo: eventsPanel.leadingAnchor), playerView.topAnchor.constraint(equalTo: topAnchor), playerView.bottomAnchor.constraint(equalTo: transport.topAnchor),
-            transport.leadingAnchor.constraint(equalTo: playerView.leadingAnchor), transport.trailingAnchor.constraint(equalTo: playerView.trailingAnchor), transport.bottomAnchor.constraint(equalTo: bottomAnchor), transport.heightAnchor.constraint(equalToConstant: 84),
-            timeline.leadingAnchor.constraint(equalTo: transport.leadingAnchor, constant: 16), timeline.trailingAnchor.constraint(equalTo: transport.trailingAnchor, constant: -16), timeline.topAnchor.constraint(equalTo: transport.topAnchor, constant: 8),
-            timeline.heightAnchor.constraint(equalToConstant: 24),
-            controls.leadingAnchor.constraint(equalTo: transport.leadingAnchor, constant: 16), controls.trailingAnchor.constraint(equalTo: transport.trailingAnchor, constant: -16), controls.bottomAnchor.constraint(equalTo: transport.bottomAnchor, constant: -14), controls.heightAnchor.constraint(equalToConstant: 28),
-            playbackVolume.widthAnchor.constraint(equalToConstant: 64), speedPicker.widthAnchor.constraint(equalToConstant: 64), timeLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 88),
+            toolbar.topAnchor.constraint(equalTo: transport.topAnchor), toolbar.leadingAnchor.constraint(equalTo: leadingAnchor), toolbar.trailingAnchor.constraint(equalTo: trailingAnchor), toolbar.heightAnchor.constraint(equalToConstant: 36),
+            datePicker.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: 20), datePicker.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor), datePicker.widthAnchor.constraint(equalToConstant: 185),
+            zoomPicker.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor), zoomPicker.trailingAnchor.constraint(equalTo: panBackward.leadingAnchor, constant: -12),
+            panBackward.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor), panForward.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor), panBackward.trailingAnchor.constraint(equalTo: panForward.leadingAnchor, constant: -4), panForward.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -20),
+            playerView.leadingAnchor.constraint(equalTo: leadingAnchor), playerView.trailingAnchor.constraint(equalTo: eventsPanel.leadingAnchor), playerView.topAnchor.constraint(equalTo: topAnchor), playerView.bottomAnchor.constraint(equalTo: transport.topAnchor),
+            eventsPanel.trailingAnchor.constraint(equalTo: trailingAnchor), eventsPanel.topAnchor.constraint(equalTo: topAnchor), eventsPanel.bottomAnchor.constraint(equalTo: transport.topAnchor), eventsPanel.widthAnchor.constraint(equalToConstant: 210),
+            eventsTitle.topAnchor.constraint(equalTo: eventsPanel.topAnchor, constant: 20), eventsTitle.leadingAnchor.constraint(equalTo: eventsPanel.leadingAnchor, constant: 16),
+            eventStatus.topAnchor.constraint(equalTo: eventsTitle.bottomAnchor, constant: 12), eventStatus.leadingAnchor.constraint(equalTo: eventsTitle.leadingAnchor), eventStatus.trailingAnchor.constraint(equalTo: eventsPanel.trailingAnchor, constant: -16),
+            eventsScroll.topAnchor.constraint(equalTo: eventStatus.bottomAnchor, constant: 16), eventsScroll.leadingAnchor.constraint(equalTo: eventsTitle.leadingAnchor), eventsScroll.trailingAnchor.constraint(equalTo: eventsPanel.trailingAnchor, constant: -16), eventsScroll.bottomAnchor.constraint(equalTo: eventsPanel.bottomAnchor, constant: -12), eventList.widthAnchor.constraint(equalTo: eventsScroll.widthAnchor, constant: -8),
+            transport.leadingAnchor.constraint(equalTo: leadingAnchor), transport.trailingAnchor.constraint(equalTo: trailingAnchor), transport.bottomAnchor.constraint(equalTo: bottomAnchor), transport.heightAnchor.constraint(equalToConstant: 160),
+            timeline.leadingAnchor.constraint(equalTo: transport.leadingAnchor), timeline.trailingAnchor.constraint(equalTo: transport.trailingAnchor), timeline.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 4), timeline.heightAnchor.constraint(equalToConstant: 76),
+            controls.leadingAnchor.constraint(equalTo: transport.leadingAnchor, constant: 16), controls.trailingAnchor.constraint(equalTo: transport.trailingAnchor, constant: -16), controls.bottomAnchor.constraint(equalTo: transport.bottomAnchor, constant: -12), controls.heightAnchor.constraint(equalToConstant: 28),
+            playbackVolume.widthAnchor.constraint(equalToConstant: 80), speedPicker.widthAnchor.constraint(equalToConstant: 64), timeLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 88),
             empty.centerXAnchor.constraint(equalTo: playerView.centerXAnchor), empty.centerYAnchor.constraint(equalTo: playerView.centerYAnchor), empty.widthAnchor.constraint(lessThanOrEqualTo: playerView.widthAnchor, constant: -32)
         ])
         updateControls()
-        playerStateObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] _, _ in
-            DispatchQueue.main.async { self?.updatePlayButton() }
+        playerStateObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] _, _ in DispatchQueue.main.async { self?.updatePlayButton() } }
+        observer = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.2, preferredTimescale: 600), queue: .main) { [weak self] time in
+            guard let self, let selected = self.selected, !self.seeking, !self.timeline.isTracking, time.seconds.isFinite else { return }
+            let date = selected.startedAt.addingTimeInterval(time.seconds)
+            if let end = self.schedule?.interval.end, date >= end { self.pause(); self.cursor = end }
+            else { self.cursor = date }
+            self.updateCursor()
         }
-        observer = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { [weak self] time in
-            guard let self, let selected = self.selected else { return }
-            if !self.timeline.isHighlighted { self.timeline.doubleValue = time.seconds.isFinite ? time.seconds : 0 }
-            self.timeLabel.stringValue = Self.clock(max(0, time.seconds.isFinite ? time.seconds : 0)) + " / " + Self.clock(selected.duration)
+        endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main) { [weak self] note in
+            guard let self, let item = note.object as? AVPlayerItem, item === self.player.currentItem, self.wantsPlayback, !self.seeking, let selected = self.selected, let schedule = self.schedule else { return }
+            guard self.player.currentTime().seconds >= selected.duration - 0.1 else { return }
+            let end = selected.startedAt.addingTimeInterval(selected.duration)
+            if let next = schedule.position(at: end, snapForward: true) { self.seek(to: next.recording.startedAt.addingTimeInterval(next.offset)) }
+            else { self.pause(); self.cursor = min(schedule.interval.end, end); self.updateCursor() }
         }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
-    deinit { if let observer { player.removeTimeObserver(observer) } }
+    deinit { if let observer { player.removeTimeObserver(observer) }; if let endObserver { NotificationCenter.default.removeObserver(endObserver) } }
 
     func update(library: CameraRecordingLibrary, sourceID: String?, recordingActive: Bool? = nil) {
         if let recordingActive { self.recordingActive = recordingActive }
         self.library = library
-        if self.sourceID != sourceID { self.sourceID = sourceID; day = nil; clearSelection() }
+        let changedSource = self.sourceID != sourceID
+        if changedSource { self.sourceID = sourceID; day = nil; cursor = nil; clearSelection() }
         let entries = library.entries.filter { sourceID == nil || $0.sourceID == sourceID }
-        dates = Array(Set(entries.map { Calendar.current.startOfDay(for: $0.startedAt) })).sorted(by: >)
-        if day == nil { day = dates.first }
+        dates = CameraPlaybackDay.availableDates(recordings: entries)
+        let oldDay = schedule?.interval.start
+        if day == nil || !dates.contains(day!) { day = dates.first }
         datePicker.removeAllItems()
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy 年 M 月 d 日"
+        let formatter = DateFormatter(); formatter.dateFormat = "yyyy 年 M 月 d 日"
         dates.forEach { datePicker.addItem(withTitle: formatter.string(from: $0)) }
         if let day, let index = dates.firstIndex(of: day) { datePicker.selectItem(at: index) }
-        if dates.isEmpty { datePicker.addItem(withTitle: "暂无录像"); datePicker.isEnabled = false } else { datePicker.isEnabled = true }
-        visible = entries.filter { day == nil || Calendar.current.isDate($0.startedAt, inSameDayAs: day!) }
-        Self.clear(recordings)
-        for (index, entry) in visible.enumerated() {
-            let date = DateFormatter()
-            date.dateFormat = "HH:mm:ss"
-            let title = date.string(from: entry.startedAt) + "   ·   " + Self.clock(entry.duration)
-            let button = NSButton(title: title, target: self, action: #selector(selectRecording(_:)))
-            button.tag = index
-            button.bezelStyle = .rounded
-            button.alignment = .left
-            button.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-            button.contentTintColor = entry.id == selected?.id ? .controlAccentColor : .labelColor
-            button.setAccessibilityLabel("回放 " + title)
-            recordings.addArrangedSubview(button)
-            button.widthAnchor.constraint(equalTo: recordings.widthAnchor).isActive = true
+        if dates.isEmpty { datePicker.addItem(withTitle: "暂无录像") }
+        datePicker.isEnabled = !dates.isEmpty
+        let model = CameraPlaybackDay(date: day ?? Date(), recordings: entries)
+        schedule = model
+        visible = model.recordings
+        let changedDay = changedSource || oldDay != model.interval.start
+        timeline.configure(day: model, reset: changedDay)
+        if changedDay { zoomPicker.selectedSegment = 0; cursor = nil; clearSelection() }
+        if let selected, !visible.contains(where: { $0.id == selected.id }) { clearSelection() }
+        if selected == nil {
+            empty.isHidden = false
+            empty.stringValue = visible.isEmpty ? (self.recordingActive ? "正在录制，片段保存后可回放" : "这天没有录像") : (cursor == nil ? "点击时间轴中的蓝色时段开始回放" : "此时段没有录像")
         }
-        if let selected, let updated = visible.first(where: { $0.id == selected.id }) { self.selected = updated; updateEvents() }
-        else if selected != nil { clearSelection() }
-        empty.isHidden = selected != nil
-        empty.stringValue = visible.isEmpty ? (self.recordingActive ? "正在录制，片段保存后可回放" : "开启录制后，可在这里查看回放") : "选择左侧录像开始回放"
+        updateEvents()
         updateControls()
+        updateCursor()
     }
 
-    func pause() { player.pause(); updatePlayButton() }
-    func selectFirstRecording() { if !visible.isEmpty { select(index: 0) } }
+    func pause() { wantsPlayback = false; player.pause(); updatePlayButton() }
+
+    func selectFirstRecording() {
+        guard let schedule, let first = schedule.recordings.first else { return }
+        seek(to: max(schedule.interval.start, first.startedAt))
+    }
 
     func performFirstEventJump() -> Bool {
-        guard let button = eventList.arrangedSubviews.first as? NSButton, let event = selected?.events.first else { return false }
+        guard let event = schedule?.personIntervals.first, let button = eventList.arrangedSubviews.first as? NSButton else { return false }
         button.performClick(nil)
-        return abs(timeline.doubleValue - event.start) < 0.01
+        return abs(timeline.doubleValue - event.start.timeIntervalSince(timeline.dayStart)) < 0.01
     }
 
-    private func select(index: Int) {
-        guard visible.indices.contains(index), let library else { return }
-        selected = visible[index]
-        player.pause()
-        player.replaceCurrentItem(with: AVPlayerItem(url: library.movieURL(visible[index])))
-        timeline.maxValue = visible[index].duration
-        timeline.doubleValue = 0
+    private func seek(to date: Date, snapForward: Bool = false, autoplay: Bool = true) {
+        guard let schedule else { return }
+        seekGeneration += 1
+        let request = seekGeneration
+        cursor = date
+        timeline.followsPlayback = true
+        guard let position = schedule.position(at: date, snapForward: snapForward) else {
+            clearSelection()
+            cursor = date
+            empty.isHidden = false
+            empty.stringValue = "此时段没有录像"
+            updateCursor()
+            return
+        }
+        cursor = position.recording.startedAt.addingTimeInterval(position.offset)
+        wantsPlayback = autoplay
+        seeking = true
+        selected = position.recording
+        if (player.currentItem?.asset as? AVURLAsset)?.url.lastPathComponent != position.recording.filename {
+            guard let library else { return }
+            player.pause()
+            player.replaceCurrentItem(with: AVPlayerItem(url: library.movieURL(position.recording)))
+        }
         empty.isHidden = true
-        playSelection()
-        update(library: library, sourceID: sourceID)
+        updateCursor()
+        updateControls()
+        let item = player.currentItem
+        player.seek(to: CMTime(seconds: position.offset, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] completed in
+            DispatchQueue.main.async {
+                guard let self, request == self.seekGeneration, item === self.player.currentItem else { return }
+                self.seeking = false
+                if completed && self.wantsPlayback { self.player.playImmediately(atRate: self.selectedRate) }
+                self.updatePlayButton()
+            }
+        }
     }
 
     private func clearSelection() {
+        seekGeneration += 1
+        seeking = false
         selected = nil
-        player.pause()
+        pause()
         player.replaceCurrentItem(with: nil)
-        Self.clear(eventList)
-        eventStatus.stringValue = "选择一段录像"
-        timeline.events = []
-        timeline.doubleValue = 0
-        timeLabel.stringValue = "00:00 / 00:00"
-        timeline.needsDisplay = true
         updateControls()
     }
 
+    private func updateCursor() {
+        guard let schedule else { return }
+        let date = cursor ?? schedule.interval.start
+        timeline.doubleValue = date.timeIntervalSince(schedule.interval.start)
+        if timeline.followsPlayback { timeline.reveal(date) }
+        timeLabel.stringValue = date == schedule.interval.end ? "24:00:00" : Self.clock(date)
+    }
+
     private func updateEvents() {
-        Self.clear(eventList)
-        guard let selected else { return }
-        timeline.events = selected.events
-        timeline.needsDisplay = true
-        switch selected.indexState {
-        case "processing": eventStatus.stringValue = "正在识别人物…"
-        case "failed":
-            eventStatus.stringValue = "人物识别未完成"
-            let retry = NSButton(title: "重新识别", target: self, action: #selector(retryIndex))
-            eventList.addArrangedSubview(retry)
-        default: eventStatus.stringValue = selected.events.isEmpty ? "未检测到人物" : "\(selected.events.count) 段人物活动"
-        }
-        for (index, event) in selected.events.enumerated() {
+        for view in eventList.arrangedSubviews { eventList.removeArrangedSubview(view); view.removeFromSuperview() }
+        guard let schedule else { return }
+        let pending = visible.contains { $0.indexState == "processing" }
+        let failed = visible.contains { $0.indexState == "failed" }
+        eventStatus.stringValue = schedule.personIntervals.isEmpty ? (pending ? "正在识别人物…" : (failed ? "人物识别未完成" : "未检测到人物")) : "\(schedule.personIntervals.count) 段人物活动" + (pending ? " · 识别中" : "")
+        if failed { eventList.addArrangedSubview(NSButton(title: "重新识别", target: self, action: #selector(retryIndex))) }
+        for (index, event) in schedule.personIntervals.enumerated() {
             let button = NSButton(title: Self.clock(event.start) + " – " + Self.clock(event.end), target: self, action: #selector(jumpToEvent(_:)))
             button.tag = index
             button.bezelStyle = .rounded
             button.image = NSImage(systemSymbolName: "figure.walk", accessibilityDescription: nil)
             button.imagePosition = .imageLeading
             button.contentTintColor = .systemOrange
-            button.setAccessibilityLabel("人物出现，跳转至 " + Self.clock(event.start))
+            button.setAccessibilityLabel("有人出现，跳转至 " + Self.clock(event.start))
             eventList.addArrangedSubview(button)
         }
     }
 
     private func configure(_ button: NSButton, symbol: String, label: String, action: Selector, identifier: String) {
-        button.target = self
-        button.action = action
+        button.target = self; button.action = action
         button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-        button.imagePosition = .imageOnly
-        button.isBordered = false
-        button.contentTintColor = .labelColor
-        button.toolTip = label
-        button.setAccessibilityLabel(label)
-        button.setAccessibilityIdentifier(identifier)
+        button.imagePosition = .imageOnly; button.isBordered = false; button.contentTintColor = .labelColor
+        button.toolTip = label; button.setAccessibilityLabel(label); button.setAccessibilityIdentifier(identifier)
         button.widthAnchor.constraint(equalToConstant: 28).isActive = true
         button.heightAnchor.constraint(equalToConstant: 28).isActive = true
     }
@@ -258,68 +277,60 @@ final class CameraPlaybackView: NSView {
     private var selectedRate: Float { playbackRates[speedPicker.indexOfSelectedItem] }
 
     private func updateControls() {
-        let enabled = selected != nil
-        for button in [playPause, skipBackward, skipForward, mute] { button.isEnabled = enabled }
-        timeline.isEnabled = enabled
-        playbackVolume.isEnabled = enabled
-        speedPicker.isEnabled = enabled
+        let enabled = !visible.isEmpty
+        for button in [playPause, skipBackward, skipForward, mute, panBackward, panForward] { button.isEnabled = enabled }
+        timeline.isEnabled = enabled; zoomPicker.isEnabled = enabled; playbackVolume.isEnabled = enabled; speedPicker.isEnabled = enabled
         updatePlayButton()
     }
 
     private func updatePlayButton() {
-        let playing = player.rate > 0
+        let playing = wantsPlayback && (player.rate > 0 || seeking)
         playPause.image = NSImage(systemSymbolName: playing ? "pause.fill" : "play.fill", accessibilityDescription: nil)
         playPause.setAccessibilityLabel(playing ? "暂停回放" : "播放回放")
         playPause.toolTip = playing ? "暂停回放" : "播放回放"
     }
 
-    private func playSelection(restartAtEnd: Bool = true) {
-        guard let selected else { return }
-        if restartAtEnd && player.currentTime().seconds >= selected.duration - 0.05 {
-            player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] completed in
-                guard let self, completed else { return }
-                self.player.playImmediately(atRate: self.selectedRate)
-            }
-        } else { player.playImmediately(atRate: selectedRate) }
-        updatePlayButton()
-    }
-
     @objc private func togglePlayback() {
-        if player.rate > 0 { pause() } else { playSelection() }
+        if wantsPlayback && (player.rate > 0 || seeking) { pause(); return }
+        if let selected, player.currentTime().seconds < selected.duration - 0.05 { wantsPlayback = true; player.playImmediately(atRate: selectedRate); updatePlayButton(); return }
+        guard let schedule else { return }
+        if let cursor {
+            if schedule.position(at: cursor, snapForward: true) != nil { seek(to: cursor, snapForward: true) }
+            else { pause(); empty.isHidden = false; empty.stringValue = "该时间之后没有录像" }
+        } else { selectFirstRecording() }
     }
 
     private func skip(_ seconds: Double) {
-        guard let selected else { return }
-        let current = player.currentTime().seconds
-        timeline.doubleValue = min(selected.duration, max(0, (current.isFinite ? current : 0) + seconds))
-        seek()
+        guard let schedule else { return }
+        let date = (cursor ?? schedule.interval.start).addingTimeInterval(seconds)
+        seek(to: min(schedule.interval.end.addingTimeInterval(-0.001), max(schedule.interval.start, date)), snapForward: true, autoplay: wantsPlayback)
     }
 
+    @objc private func changeZoom() {
+        guard let schedule else { return }
+        let spans = [schedule.interval.duration, 21600, 3600, 900]
+        timeline.followsPlayback = true
+        timeline.zoom(to: spans[zoomPicker.selectedSegment], around: cursor ?? visible.first?.startedAt ?? schedule.interval.start)
+    }
+    @objc private func panEarlier() { timeline.pan(by: -0.75) }
+    @objc private func panLater() { timeline.pan(by: 0.75) }
     @objc private func skipBackwardTenSeconds() { skip(-10) }
     @objc private func skipForwardTenSeconds() { skip(10) }
     @objc private func changePlaybackSpeed() { if player.rate > 0 { player.rate = selectedRate } }
     @objc private func toggleFullscreen() { onToggleFullscreen?() }
     @objc private func toggleMute() { player.isMuted.toggle(); updateMuteButton() }
     @objc private func changePlaybackVolume() { player.volume = Float(playbackVolume.doubleValue); player.isMuted = false; updateMuteButton() }
-
     private func updateMuteButton() {
         let muted = player.isMuted || player.volume == 0
         mute.image = NSImage(systemSymbolName: muted ? "speaker.slash.fill" : "speaker.wave.2.fill", accessibilityDescription: nil)
         mute.setAccessibilityLabel(muted ? "取消回放静音" : "静音回放")
-        mute.toolTip = muted ? "取消回放静音" : "静音回放"
     }
-
-    @objc private func selectRecording(_ sender: NSButton) { select(index: sender.tag) }
-    @objc private func changeDate() { guard dates.indices.contains(datePicker.indexOfSelectedItem), let library else { return }; day = dates[datePicker.indexOfSelectedItem]; clearSelection(); update(library: library, sourceID: sourceID) }
-    @objc private func seek() { player.seek(to: CMTime(seconds: timeline.doubleValue, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) }
-    @objc private func jumpToEvent(_ sender: NSButton) { guard let selected, selected.events.indices.contains(sender.tag) else { return }; timeline.doubleValue = selected.events[sender.tag].start; seek(); playSelection(restartAtEnd: false) }
-    @objc private func retryIndex() { if let selected { library?.index(selected) } }
-
-    private static func clear(_ stack: NSStackView) {
-        for view in stack.arrangedSubviews { stack.removeArrangedSubview(view); view.removeFromSuperview() }
+    @objc private func changeDate() {
+        guard dates.indices.contains(datePicker.indexOfSelectedItem), let library else { return }
+        day = dates[datePicker.indexOfSelectedItem]; cursor = nil; clearSelection(); update(library: library, sourceID: sourceID); selectFirstRecording()
     }
-
-    private static func clock(_ time: Double) -> String { let value = Int(time); return String(format: "%02d:%02d", value / 60, value % 60) }
-    private static func label(_ text: String, size: CGFloat, weight: NSFont.Weight) -> NSTextField { let label = NSTextField(labelWithString: text); label.font = .systemFont(ofSize: size, weight: weight); return label }
-    private static func scroll(_ content: NSView) -> NSScrollView { let scroll = NSScrollView(); scroll.drawsBackground = false; scroll.hasVerticalScroller = true; scroll.documentView = content; content.translatesAutoresizingMaskIntoConstraints = false; return scroll }
+    @objc private func seekTimeline() { seek(to: timeline.dayStart.addingTimeInterval(timeline.doubleValue)) }
+    @objc private func jumpToEvent(_ sender: NSButton) { guard let events = schedule?.personIntervals, events.indices.contains(sender.tag) else { return }; seek(to: events[sender.tag].start, snapForward: true) }
+    @objc private func retryIndex() { for entry in visible where entry.indexState == "failed" { library?.index(entry) } }
+    private static func clock(_ date: Date) -> String { let formatter = DateFormatter(); formatter.dateFormat = "HH:mm:ss"; return formatter.string(from: date) }
 }
