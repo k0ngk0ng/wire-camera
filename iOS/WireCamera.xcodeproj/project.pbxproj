@@ -136,6 +136,24 @@
 			<key>fileRef</key>
 			<string>45371CC705049E16C877FECD</string>
 		</dict>
+		<key>0C4A64A3E189F2E1FB3EAFE4</key>
+		<dict>
+			<key>isa</key>
+			<string>PBXFileReference</string>
+			<key>lastKnownFileType</key>
+			<string>sourcecode.swift</string>
+			<key>path</key>
+			<string>../Shared/CameraPlaybackResource.swift</string>
+			<key>sourceTree</key>
+			<string>&lt;group&gt;</string>
+		</dict>
+		<key>53230CE4D791CE035F5868D6</key>
+		<dict>
+			<key>isa</key>
+			<string>PBXBuildFile</string>
+			<key>fileRef</key>
+			<string>0C4A64A3E189F2E1FB3EAFE4</string>
+		</dict>
 		<key>B7AAA947DF06B5ACD2B1C524</key>
 		<dict>
 			<key>isa</key>
@@ -153,6 +171,24 @@
 			<string>PBXBuildFile</string>
 			<key>fileRef</key>
 			<string>B7AAA947DF06B5ACD2B1C524</string>
+		</dict>
+		<key>8F8CC264033156E14F20C50F</key>
+		<dict>
+			<key>isa</key>
+			<string>PBXFileReference</string>
+			<key>lastKnownFileType</key>
+			<string>sourcecode.swift</string>
+			<key>path</key>
+			<string>../Shared/CameraRemoteTrust.swift</string>
+			<key>sourceTree</key>
+			<string>&lt;group&gt;</string>
+		</dict>
+		<key>226AB491133AB8984986E84B</key>
+		<dict>
+			<key>isa</key>
+			<string>PBXBuildFile</string>
+			<key>fileRef</key>
+			<string>8F8CC264033156E14F20C50F</string>
 		</dict>
 		<key>C4C19665A910E4322A6987E9</key>
 		<dict>
@@ -187,7 +223,9 @@
 				<string>A25FA6AF79BA2E7F1B5BFF3E</string>
 				<string>2BF58D76664013BA08412322</string>
 				<string>E106147AB6901B5736216D7B</string>
+				<string>53230CE4D791CE035F5868D6</string>
 				<string>1B8CAFE309BC310904C0E337</string>
+				<string>226AB491133AB8984986E84B</string>
 				<string>E74B28F2495E33434AC5F60B</string>
 			</array>
 			<key>runOnlyForDeploymentPostprocessing</key>
@@ -304,7 +342,9 @@
 				<string>B69CE41585F1F599D146CC8D</string>
 				<string>B3AF3ACF5B06B601CF51E398</string>
 				<string>45371CC705049E16C877FECD</string>
+				<string>0C4A64A3E189F2E1FB3EAFE4</string>
 				<string>B7AAA947DF06B5ACD2B1C524</string>
+				<string>8F8CC264033156E14F20C50F</string>
 				<string>C4C19665A910E4322A6987E9</string>
 				<string>765F72EBD3F52F8109CA2C9E</string>
 				<string>8BF729FFE074CAEE622C0292</string>
@@ -348,9 +388,9 @@
 				<key>GENERATE_INFOPLIST_FILE</key>
 				<string>YES</string>
 				<key>MARKETING_VERSION</key>
-				<string>1.0.0</string>
+				<string>1.1.0</string>
 				<key>CURRENT_PROJECT_VERSION</key>
-				<string>1</string>
+				<string>2</string>
 				<key>ASSETCATALOG_COMPILER_APPICON_NAME</key>
 				<string>AppIcon</string>
 				<key>SUPPORTS_MACCATALYST</key>
@@ -398,9 +438,9 @@
 				<key>GENERATE_INFOPLIST_FILE</key>
 				<string>YES</string>
 				<key>MARKETING_VERSION</key>
-				<string>1.0.0</string>
+				<string>1.1.0</string>
 				<key>CURRENT_PROJECT_VERSION</key>
-				<string>1</string>
+				<string>2</string>
 				<key>ASSETCATALOG_COMPILER_APPICON_NAME</key>
 				<string>AppIcon</string>
 				<key>SUPPORTS_MACCATALYST</key>

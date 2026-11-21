@@ -22,9 +22,9 @@ root=pathlib.Path(sys.argv[1])
 (root/'modules.json').write_text(json.dumps([{'deviceID':name,'address':sys.argv[2]} for name in ['fixture-manual-device','fixture-preview-device']]))
 identifier=str(uuid.uuid4()).upper()
 movie=root/'library'/(identifier+'.mov')
-subprocess.run(['ffmpeg','-v','error','-loop','1','-i','Tests/Fixtures/person-frame.jpg','-f','lavfi','-i','sine=frequency=700:sample_rate=8000','-t','3','-c:v','libx264','-pix_fmt','yuv420p','-c:a','aac',str(movie)],check=True)
+subprocess.run(['ffmpeg','-v','error','-loop','1','-i','Tests/Fixtures/person-frame.jpg','-f','lavfi','-i','sine=frequency=700:sample_rate=8000','-t','30','-c:v','libx264','-pix_fmt','yuv420p','-c:a','aac',str(movie)],check=True)
 started=datetime.datetime.now().timestamp()-86400
-(movie.with_suffix('.json')).write_text(json.dumps({'id':identifier,'sourceID':'offline:fixture','sourceName':'离线摄像头','startedAt':started-978307200,'duration':3,'events':[{'start':0,'end':2}],'indexState':'ready'}))
+(movie.with_suffix('.json')).write_text(json.dumps({'id':identifier,'sourceID':'offline:fixture','sourceName':'离线摄像头','startedAt':started-978307200,'duration':30,'events':[{'start':0,'end':2}],'indexState':'ready'}))
 (root/'offline-id').write_text(identifier)
 outside_id=str(uuid.uuid4()).upper()
 outside=root/'outside.mov'

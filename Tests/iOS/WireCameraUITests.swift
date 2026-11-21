@@ -36,8 +36,11 @@ final class WireCameraUITests: XCTestCase {
         app.buttons["连接 Mac"].tap()
         XCTAssertTrue(app.buttons["实时"].waitForExistence(timeout: 20))
         XCTAssertTrue(app.buttons["回放"].exists)
-        if !app.buttons["Wi-Fi · fixture-manual-device"].exists { app.buttons["选择摄像头"].tap() }
-        app.buttons["Wi-Fi · fixture-manual-device"].tap()
+        if !app.staticTexts["Wi-Fi · fixture-manual-device"].exists {
+            if !app.buttons["Wi-Fi · fixture-manual-device"].exists { app.buttons["选择摄像头"].coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap() }
+            XCTAssertTrue(app.buttons["Wi-Fi · fixture-manual-device"].waitForExistence(timeout: 5))
+            app.buttons["Wi-Fi · fixture-manual-device"].tap()
+        }
         let liveView = app.descendants(matching: .any).matching(identifier: "实时画面").firstMatch
         let liveReady = expectation(for: NSPredicate(format: "value == %@", "正在播放"), evaluatedWith: liveView)
         wait(for: [liveReady], timeout: 20)
@@ -53,10 +56,20 @@ final class WireCameraUITests: XCTestCase {
         XCTAssertFalse(app.secureTextFields["连接密码"].exists)
         app.buttons["回放"].tap()
         XCTAssertTrue(app.buttons["选择摄像头"].waitForExistence(timeout: 10))
-        app.buttons["选择摄像头"].tap()
+        app.buttons["选择摄像头"].coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         app.buttons["离线摄像头"].tap()
         XCTAssertTrue(app.otherElements["全天时间轴"].waitForExistence(timeout: 15))
-        XCTAssertTrue(app.buttons["下一个人物"].exists)
+        XCTAssertTrue(app.buttons["下一个活动"].exists)
+        let playbackView = app.buttons["回放画面"].firstMatch
+        let playbackReady = expectation(for: NSPredicate(format: "value == %@", "正在播放"), evaluatedWith: playbackView)
+        wait(for: [playbackReady], timeout: 20)
+        playbackView.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        XCTAssertTrue(app.buttons["播放"].waitForExistence(timeout: 5))
+        playbackView.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        XCTAssertTrue(app.buttons["暂停"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["变化"].exists)
+        app.buttons["变化"].tap()
+        app.buttons["全部"].tap()
         let layout = XCTAttachment(string: "window=\(app.frame); video=\(app.buttons["回放画面"].firstMatch.frame); timeline=\(app.otherElements["全天时间轴"].frame)")
         layout.name = "窗口与布局尺寸"
         layout.lifetime = .keepAlways

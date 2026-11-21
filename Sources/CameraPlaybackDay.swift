@@ -9,6 +9,7 @@ struct CameraPlaybackDay {
     let interval: DateInterval
     let recordings: [CameraRecording]
     let personIntervals: [DateInterval]
+    let motionIntervals: [DateInterval]
 
     init(date: Date, recordings: [CameraRecording], calendar: Calendar = .current) {
         let interval = calendar.dateInterval(of: .day, for: date)!
@@ -18,11 +19,39 @@ struct CameraPlaybackDay {
         }.sorted {
             $0.startedAt == $1.startedAt ? $0.id < $1.id : $0.startedAt < $1.startedAt
         }
+        personIntervals = Self.intervals(recordings: self.recordings, day: interval, motion: false)
+        motionIntervals = Self.intervals(recordings: self.recordings, day: interval, motion: true)
+    }
+
+    func events(matching filter: CameraPlaybackEventFilter) -> [CameraPlaybackEvent] {
+        var result: [CameraPlaybackEvent] = []
+        if filter != .motion { result += personIntervals.map { CameraPlaybackEvent(interval: $0, isPerson: true) } }
+        if filter != .person {
+            for motion in motionIntervals {
+                var remaining = [motion]
+                if filter == .all {
+                    for person in personIntervals {
+                        remaining = remaining.flatMap { interval -> [DateInterval] in
+                            guard interval.start < person.end && interval.end > person.start else { return [interval] }
+                            var pieces: [DateInterval] = []
+                            if interval.start < person.start { pieces.append(DateInterval(start: interval.start, end: person.start)) }
+                            if interval.end > person.end { pieces.append(DateInterval(start: person.end, end: interval.end)) }
+                            return pieces
+                        }
+                    }
+                }
+                result += remaining.map { CameraPlaybackEvent(interval: $0, isPerson: false) }
+            }
+        }
+        return result.sorted { $0.start < $1.start }
+    }
+
+    private static func intervals(recordings: [CameraRecording], day: DateInterval, motion: Bool) -> [DateInterval] {
         var events: [DateInterval] = []
-        for recording in self.recordings {
-            for event in recording.events {
-                let start = max(interval.start, recording.startedAt.addingTimeInterval(event.start))
-                let end = min(interval.end, recording.startedAt.addingTimeInterval(min(recording.duration, event.end)))
+        for recording in recordings {
+            for event in motion ? (recording.motionEvents ?? []) : recording.events {
+                let start = max(day.start, recording.startedAt.addingTimeInterval(event.start))
+                let end = min(day.end, recording.startedAt.addingTimeInterval(min(recording.duration, event.end)))
                 if start < end { events.append(DateInterval(start: start, end: end)) }
             }
         }
@@ -32,7 +61,7 @@ struct CameraPlaybackDay {
                 merged[merged.count - 1] = DateInterval(start: last.start, end: max(last.end, event.end))
             } else { merged.append(event) }
         }
-        personIntervals = merged
+        return merged
     }
 
     func position(at date: Date, snapForward: Bool = false) -> CameraPlaybackPosition? {
@@ -59,4 +88,24 @@ struct CameraPlaybackDay {
         }
         return dates.sorted(by: >)
     }
+}
+
+
+enum CameraPlaybackEventFilter: Int, CaseIterable {
+    case all, person, motion
+    var title: String {
+        switch self {
+        case .all: return "全部"
+        case .person: return "有人"
+        case .motion: return "变化"
+        }
+    }
+}
+
+struct CameraPlaybackEvent {
+    let interval: DateInterval
+    let isPerson: Bool
+    var start: Date { interval.start }
+    var end: Date { interval.end }
+    var label: String { isPerson ? "有人" : "画面变化" }
 }

@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import ImageIO
 import Vision
 
 private final class CameraLibraryTask {
@@ -54,6 +55,7 @@ final class CameraRecordingLibrary {
     private(set) var entries: [CameraRecording] = []
     private let queue = DispatchQueue(label: "camera.person-index", qos: .utility)
     private var indexing: [String: CameraLibraryTask] = [:]
+    private var attemptedIndexes: Set<String> = []
     private var readers: [String: Int] = [:]
     private var deleting: Set<String> = []
     private let cleanupQueue = DispatchQueue(label: "camera.retention", qos: .utility)
@@ -171,14 +173,21 @@ final class CameraRecordingLibrary {
     }
 
     func resumeIndexing() {
-        for entry in entries where entry.indexState == "processing" || entry.indexState == "failed" { index(entry) }
+        guard indexing.isEmpty, let entry = entries.first(where: { !attemptedIndexes.contains($0.id) && ($0.indexState != "ready" || $0.motionIndexState != "ready" || $0.motionIndexVersion != 1) }) else { return }
+        index(entry)
     }
 
     func index(_ entry: CameraRecording) {
         guard indexing[entry.id] == nil, !deleting.contains(entry.id) else { return }
         let task = CameraLibraryTask()
         indexing[entry.id] = task
-        if let index = entries.firstIndex(where: { $0.id == entry.id }) { entries[index].indexState = "processing"; onChange?() }
+        attemptedIndexes.insert(entry.id)
+        let needsPeople = entry.indexState != "ready"
+        if let index = entries.firstIndex(where: { $0.id == entry.id }) {
+            if needsPeople { entries[index].indexState = "processing" }
+            entries[index].motionIndexState = "processing"
+            onChange?()
+        }
         let url = movieURL(entry)
         queue.async {
             guard !task.isCancelled else { return }
@@ -188,37 +197,69 @@ final class CameraRecordingLibrary {
                 guard let video = asset.tracks(withMediaType: .video).first else { throw self.failure("录像没有可分析的视频画面。") }
                 let analysisDuration = min(entry.duration, video.timeRange.end.seconds)
                 guard analysisDuration.isFinite, analysisDuration > 0 else { throw self.failure("录像的视频时长不正确。") }
-                let generator = AVAssetImageGenerator(asset: asset)
-                generator.appliesPreferredTrackTransform = true
-                generator.maximumSize = CGSize(width: 640, height: 640)
-                generator.requestedTimeToleranceBefore = CMTime(seconds: 0.3, preferredTimescale: 600)
-                generator.requestedTimeToleranceAfter = CMTime(seconds: 0.3, preferredTimescale: 600)
-                var detected: [Double] = []
-                for second in stride(from: 0.0, to: analysisDuration, by: 1) {
+                let reader = try AVAssetReader(asset: asset)
+                let output = AVAssetReaderTrackOutput(track: video, outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange])
+                output.alwaysCopiesSampleData = false
+                guard reader.canAdd(output) else { throw self.failure("无法分析录像画面。") }
+                reader.add(output)
+                guard reader.startReading() else { throw reader.error ?? self.failure("无法读取录像。") }
+                defer { reader.cancelReading() }
+                let transform = video.preferredTransform
+                let angle = atan2(transform.b, transform.a)
+                let orientation: CGImagePropertyOrientation = abs(angle - .pi / 2) < 0.1 ? .right : (abs(angle + .pi / 2) < 0.1 ? .left : (abs(angle) > 3 ? .down : .up))
+                let detector = CameraMotionDetector()
+                var people: [Double] = [], motion: [Double] = []
+                var nextMotion = 0.0, nextPerson = 0.0
+                var personFailed = false, sampleCount = 0
+                while reader.status == .reading {
                     if task.isCancelled { throw CancellationError() }
-                    try autoreleasepool {
-                        let image = try generator.copyCGImage(at: CMTime(seconds: second, preferredTimescale: 600), actualTime: nil)
-                        let request = VNDetectHumanRectanglesRequest()
-                        request.upperBodyOnly = true
-                        try VNImageRequestHandler(cgImage: image).perform([request])
-                        if request.results?.contains(where: { $0.confidence >= 0.6 }) == true { detected.append(second) }
+                    let hasSample = autoreleasepool { () -> Bool in
+                        guard let sample = output.copyNextSampleBuffer() else { return false }
+                        let second = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+                        guard second.isFinite, second >= 0, second < analysisDuration, second + 0.001 >= nextMotion,
+                              let pixels = CMSampleBufferGetImageBuffer(sample) else { return true }
+                        sampleCount += 1
+                        nextMotion = second + 0.25
+                        if detector.process(pixels) { motion.append(second) }
+                        if needsPeople && second + 0.001 >= nextPerson {
+                            nextPerson = second + 1
+                            do {
+                                let request = VNDetectHumanRectanglesRequest()
+                                request.upperBodyOnly = true
+                                try VNImageRequestHandler(cvPixelBuffer: pixels, orientation: orientation).perform([request])
+                                if request.results?.contains(where: { $0.confidence >= 0.6 }) == true { people.append(second) }
+                            } catch { personFailed = true }
+                        }
+                        return true
                     }
+                    if !hasSample { break }
                 }
-                updated.events = Self.personEvents(times: detected, duration: analysisDuration)
-                updated.indexState = "ready"
-            } catch { updated.indexState = "failed" }
+                guard reader.status != .failed, sampleCount > 0 else { throw reader.error ?? self.failure("录像没有可分析的画面。") }
+                if needsPeople {
+                    updated.events = Self.personEvents(times: people, duration: analysisDuration)
+                    updated.indexState = personFailed ? "failed" : "ready"
+                }
+                updated.motionEvents = Self.personEvents(times: motion, duration: analysisDuration)
+                updated.motionIndexState = "ready"
+                updated.motionIndexVersion = 1
+            } catch {
+                if needsPeople { updated.indexState = "failed" }
+                updated.motionIndexState = "failed"
+            }
             let result = updated
             DispatchQueue.main.async {
                 guard self.indexing[entry.id] === task, !task.isCancelled, self.entries.contains(where: { $0.id == entry.id }) else { return }
                 self.indexing.removeValue(forKey: entry.id)
                 do { try self.persist(result) }
                 catch {
-                    if let index = self.entries.firstIndex(where: { $0.id == result.id }) { self.entries[index].indexState = "failed" }
+                    if let index = self.entries.firstIndex(where: { $0.id == result.id }) { self.entries[index].motionIndexState = "failed"; if needsPeople { self.entries[index].indexState = "failed" } }
                     self.onChange?()
+                    self.resumeIndexing()
                     return
                 }
                 if let index = self.entries.firstIndex(where: { $0.id == result.id }) { self.entries[index] = result }
                 self.onChange?()
+                self.resumeIndexing()
             }
         }
     }
@@ -244,7 +285,7 @@ final class CameraRecordingLibrary {
               let data = try? Data(contentsOf: url), let entry = try? JSONDecoder().decode(CameraRecording.self, from: data),
               UUID(uuidString: entry.id) != nil, url.deletingPathExtension().lastPathComponent == entry.id,
               entry.startedAt.timeIntervalSince1970.isFinite, entry.duration.isFinite, entry.duration > 0,
-              entry.events.allSatisfy({ $0.start.isFinite && $0.end.isFinite && $0.start >= 0 && $0.start < $0.end && $0.end <= entry.duration }) else { return nil }
+              (entry.events + (entry.motionEvents ?? [])).allSatisfy({ $0.start.isFinite && $0.end.isFinite && $0.start >= 0 && $0.start < $0.end && $0.end <= entry.duration }) else { return nil }
         return entry
     }
 

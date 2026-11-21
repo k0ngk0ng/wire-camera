@@ -17,7 +17,7 @@ for path in paths:
         if token.type == tokenize.COMMENT:
             errors.append(f'{relative}:{token.start[0]}: 代码文件不得包含注释。')
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not re.fullmatch(r'[a-z_][a-z0-9_]*', node.name):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not re.fullmatch(r'[a-z_][a-z0-9_]*|do_(GET|HEAD|POST|PUT|DELETE)', node.name):
             errors.append(f'{relative}:{node.lineno}: 函数必须使用 snake_case 命名。')
         if isinstance(node, ast.ClassDef) and not re.fullmatch(r'[A-Z][A-Za-z0-9]*', node.name):
             errors.append(f'{relative}:{node.lineno}: 类必须使用 PascalCase 命名。')

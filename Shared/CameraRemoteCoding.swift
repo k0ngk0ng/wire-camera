@@ -14,6 +14,9 @@ struct CameraRecording: Codable, Identifiable {
     let duration: Double
     var events: [CameraPersonEvent]
     var indexState: String
+    var motionEvents: [CameraPersonEvent]?
+    var motionIndexState: String?
+    var motionIndexVersion: Int?
 
     var filename: String { id + ".mov" }
 }
@@ -37,6 +40,11 @@ struct CameraRemotePairRequest: Codable {
 
 struct CameraRemotePairResult: Codable {
     let token: String
+}
+
+struct CameraPlaybackTicket: Codable {
+    let id: String
+    let expiresIn: Double
 }
 
 enum CameraRemoteCoding {

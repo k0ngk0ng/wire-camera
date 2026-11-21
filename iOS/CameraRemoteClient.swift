@@ -21,29 +21,6 @@ enum CameraRemoteFailure: LocalizedError {
     }
 }
 
-final class CameraRemoteTrust: NSObject, URLSessionDelegate {
-    private let lock = NSLock()
-    private var pinned: String?
-    private var observed: String?
-
-    init(fingerprint: String?) { pinned = fingerprint }
-
-    var fingerprint: String? { lock.lock(); defer { lock.unlock() }; return observed }
-
-    func pin(_ value: String) { lock.lock(); pinned = value; lock.unlock() }
-
-    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-              let trust = challenge.protectionSpace.serverTrust, let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate], let certificate = chain.first else { completionHandler(.performDefaultHandling, nil); return }
-        let value = CameraRemoteCoding.fingerprint(SecCertificateCopyData(certificate) as Data)
-        lock.lock()
-        let allowed = pinned == nil || pinned == value
-        if allowed { observed = value }
-        lock.unlock()
-        completionHandler(allowed ? .useCredential : .cancelAuthenticationChallenge, allowed ? URLCredential(trust: trust) : nil)
-    }
-}
-
 final class CameraRemoteClient {
     let credentials: CameraRemoteCredentials
     private let trust: CameraRemoteTrust
@@ -55,6 +32,10 @@ final class CameraRemoteClient {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 15
         session = URLSession(configuration: configuration, delegate: trust, delegateQueue: nil)
+        #if os(iOS)
+        let legacy = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("WireCameraMovies")
+        try? FileManager.default.removeItem(at: legacy)
+        #endif
     }
 
     static func pair(host: String, port: Int, password: String, fingerprint: String? = nil) async throws -> CameraRemoteClient {
@@ -92,20 +73,9 @@ final class CameraRemoteClient {
         return request
     }
 
-    func download(_ entry: CameraRecording) async throws -> URL {
+    func playbackResource(_ entry: CameraRecording) throws -> CameraPlaybackResource {
         guard UUID(uuidString: entry.id) != nil else { throw CameraRemoteFailure.message("录像标识不正确。") }
-        let directory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("WireCameraMovies")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let destination = directory.appendingPathComponent(entry.filename)
-        if FileManager.default.fileExists(atPath: destination.path) { return destination }
-        let (temporary, response) = try await session.download(for: request("/v1/recordings/\(entry.id)/movie"))
-        try Self.validate(response)
-        try Task.checkCancellation()
-        if !FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.moveItem(at: temporary, to: destination) }
-        let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.creationDateKey])) ?? []
-        let ordered = files.sorted { ((try? $0.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast) > ((try? $1.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast) }
-        for file in ordered.dropFirst(6) where file != destination { try? FileManager.default.removeItem(at: file) }
-        return destination
+        return CameraPlaybackResource(request: try request("/v1/recordings/\(entry.id)/movie"), fingerprint: credentials.fingerprint)
     }
 
     func close() { session.invalidateAndCancel() }

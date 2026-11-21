@@ -181,21 +181,24 @@ struct CameraPhoneView: View {
     }
 
     private var personList: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 10) {
-                if model.day.personIntervals.isEmpty { Text("当天未检测到人物").font(.footnote).foregroundStyle(.secondary).padding(.vertical) }
-                ForEach(model.day.personIntervals, id: \.start) { event in
-                    Button { model.seek(event.start) } label: {
-                        HStack(spacing: 10) {
-                            Circle().fill(.orange).frame(width: 7, height: 7)
-                            Text(event.start, format: .dateTime.hour().minute().second()).monospacedDigit()
-                            Spacer()
-                            Image(systemName: "chevron.right").font(.caption)
-                        }.padding(12).background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
-                    }.foregroundStyle(.white)
+        VStack(spacing: 10) {
+            CameraPhoneEventFilter(model: model)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    if model.activityEvents.isEmpty { Text("没有匹配的活动").font(.footnote).foregroundStyle(.secondary).padding(.vertical) }
+                    ForEach(model.activityEvents, id: \.start) { event in
+                        Button { model.seek(event.start) } label: {
+                            HStack(spacing: 10) {
+                                Circle().fill(event.isPerson ? .orange : .purple).frame(width: 7, height: 7)
+                                Text(event.start, format: .dateTime.hour().minute().second()).monospacedDigit()
+                                Spacer()
+                                Image(systemName: "chevron.right").font(.caption)
+                            }.padding(12).background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+                        }.foregroundStyle(.white).accessibilityLabel(event.label + "，" + event.start.formatted(date: .omitted, time: .standard))
+                    }
                 }
-            }
-        }.accessibilityLabel("人物列表")
+            }.accessibilityLabel("活动列表")
+        }
     }
 
     private var video: some View {
@@ -234,7 +237,7 @@ struct CameraPhoneView: View {
             if model.playbackMode { Button { model.togglePlayback() } label: { Image(systemName: model.playing ? "pause.fill" : "play.fill").frame(width: 24) }.accessibilityLabel(model.playing ? "暂停" : "播放") }
             Button { model.toggleMute() } label: { Image(systemName: model.muted ? "speaker.slash.fill" : "speaker.wave.2.fill").frame(width: 24) }.accessibilityLabel(model.muted ? "开启声音" : "静音")
             if model.playbackMode {
-                Button { model.nextPerson() } label: { HStack(spacing: 6) { Circle().fill(.orange).frame(width: 6, height: 6); Text("下一个人物").font(.footnote) } }.disabled(model.day.personIntervals.isEmpty)
+                Button { model.nextEvent() } label: { HStack(spacing: 6) { Image(systemName: "forward.end.fill"); Text("下一个活动").font(.footnote) } }.disabled(model.activityEvents.isEmpty)
             }
             Spacer(minLength: 0)
             Button { fullscreen.toggle() } label: { Image(systemName: fullscreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right") }.accessibilityLabel(fullscreen ? "退出全屏" : "全屏")

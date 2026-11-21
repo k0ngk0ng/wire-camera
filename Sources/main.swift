@@ -368,6 +368,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--recording-recovery-e2e") { runRecordingRecoveryE2E() }
             else if CommandLine.arguments.contains("--multi-recording-e2e") { runMultiRecordingE2E() }
             else if CommandLine.arguments.contains("--record-preview-e2e") { runRecordPreviewE2E() }
+            else if CommandLine.arguments.contains("--motion-e2e") { runMotionE2E() }
             else { runLibraryE2E() }
         }
         if recordingTestDirectory != nil { runRecordingE2E() }
@@ -2477,6 +2478,7 @@ extension AppDelegate {
                 check("expired_movies_and_indexes_removed", !exists("old") && !exists("old", "json") && !exists("exact") && !exists("indexing") && !exists("orphan", "json"))
                 check("crossing_cutoff_recent_and_future_preserved", exists("cross") && exists("recent") && exists("future"))
                 check("active_playback_and_http_reader_protected", exists("playing") && exists("downloading"))
+                check("streaming_lease_protects_gaps_between_ranges", exists("leased"))
                 check("partial_unrelated_and_external_files_preserved", FileManager.default.fileExists(atPath: self.library.directory.appendingPathComponent(".active.partial.mov").path) && FileManager.default.fileExists(atPath: self.library.directory.appendingPathComponent("notes.json").path) && exists("symlink") && FileManager.default.fileExists(atPath: directory.appendingPathComponent("outside.mov").path))
                 check("deletion_error_is_reported_and_retryable", exists("locked") && exists("locked", "json") && !result.errors.isEmpty)
                 check("retention_save_does_not_restart_iphone_service", self.remoteServer.port == originalPort && self.remoteIdentity.settings.password == originalPassword)
@@ -2486,6 +2488,7 @@ extension AppDelegate {
             case 3:
                 guard FileManager.default.fileExists(atPath: directory.appendingPathComponent("client-released").path),
                       self.library.activeReaders(movies["downloading"] ?? "") == 0,
+                      self.library.activeReaders(movies["leased"] ?? "") == 0,
                       button("settings-cleanup-now")?.isEnabled == true else { return }
                 self.modePicker.selectedSegment = 0; self.changeMode()
                 self.playback.player.replaceCurrentItem(with: nil)
@@ -2496,7 +2499,7 @@ extension AppDelegate {
             default:
                 guard !self.library.isCleaning, let result = self.lastRetentionResult else { return }
                 if phase == 4 {
-                    check("released_readers_and_unlocked_files_removed", !exists("playing") && !exists("downloading") && !exists("locked"))
+                    check("released_readers_and_unlocked_files_removed", !exists("playing") && !exists("downloading") && !exists("leased") && !exists("locked"))
                     check("cleanup_retry_succeeds", result.errors.isEmpty)
                     finishedAt = Date(); phase = 5; return
                 }
@@ -2507,5 +2510,79 @@ extension AppDelegate {
             }
         }
         RunLoop.main.add(testTimer, forMode: .common)
+    }
+}
+
+
+extension AppDelegate {
+    private func runMotionE2E() {
+        guard let directory = libraryTestDirectory else { return }
+        let restoring = CommandLine.arguments.contains("restore")
+        let started = Date()
+        var checks: [[String: Any]] = []
+        func check(_ name: String, _ passed: Bool) { checks.append(["name": name, "passed": passed]) }
+        func finish(_ error: String? = nil) {
+            let report: [String: Any] = ["passed": error == nil && checks.allSatisfy { $0["passed"] as? Bool == true }, "error": error ?? "", "checks": checks]
+            try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]).write(to: directory.appendingPathComponent(restoring ? "restore-result.json" : "first-result.json"))
+            NSApp.terminate(nil)
+        }
+        let launchTime = (try? String(contentsOf: directory.appendingPathComponent("launch-start.txt"), encoding: .utf8)).flatMap { Double($0) } ?? Date().timeIntervalSince1970
+        check("main_responsive_during_backfill", Date().timeIntervalSince1970 - launchTime < 8)
+        let timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { timer in
+            let samples = self.library.entries.filter { ["static", "exposure", "moving", "blurred", "legacy"].contains($0.sourceName) }
+            guard samples.count == 5, samples.allSatisfy({ $0.indexState == "ready" && $0.motionIndexState == "ready" }) else {
+                if Date().timeIntervalSince(started) > 40 { timer.invalidate(); finish("索引未完成") }
+                return
+            }
+            timer.invalidate()
+            for name in ["static", "exposure", "moving", "blurred", "legacy"] {
+                let entry = self.library.entries.first { $0.sourceName == name }!
+                check(name + "_motion", !(entry.motionEvents ?? []).isEmpty == ["moving", "blurred"].contains(name))
+                check(name + "_human", name == "legacy" ? entry.events.count == 1 && entry.events[0].start == 1 && entry.events[0].end == 2 : entry.events.isEmpty)
+                check(name + "_bounds", (entry.motionEvents ?? []).allSatisfy { $0.start >= 0 && $0.start < $0.end && $0.end <= entry.duration })
+                check(name + "_version", entry.motionIndexVersion == 1)
+                let metadata = self.library.directory.appendingPathComponent(entry.id + ".json")
+                if restoring {
+                    let original = try? Data(contentsOf: directory.appendingPathComponent(name + "-index.json"))
+                    check(name + "_restored", original == (try? Data(contentsOf: metadata)))
+                } else { try? FileManager.default.copyItem(at: metadata, to: directory.appendingPathComponent(name + "-index.json")) }
+            }
+            self.modePicker.selectedSegment = 1
+            self.changeMode()
+            if let index = self.playbackSources.firstIndex(where: { $0.id == "offline:motion-blurred" }) { self.playbackPicker.selectItem(at: index); self.selectPlaybackCamera() }
+            self.playback.selectFirstRecording()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
+                let filter = descendants(self.playback).first { $0.accessibilityIdentifier() == "playback-event-filter" } as? NSSegmentedControl
+                check("event_filter_available", filter?.segmentCount == 3)
+                if let filter {
+                    filter.selectedSegment = 2
+                    filter.sendAction(filter.action, to: filter.target)
+                    check("motion_event_jump", self.playback.performFirstEventJump())
+                    filter.selectedSegment = 1
+                    filter.sendAction(filter.action, to: filter.target)
+                    check("human_filter_excludes_motion", !self.playback.performFirstEventJump())
+                    filter.selectedSegment = 2
+                    filter.sendAction(filter.action, to: filter.target)
+                    if let zoom = descendants(self.playback).first(where: { $0.accessibilityIdentifier() == "playback-zoom" }) as? NSSegmentedControl {
+                        zoom.selectedSegment = 3; zoom.sendAction(zoom.action, to: zoom.target)
+                    }
+                }
+                if let button = descendants(self.playback).first(where: { $0.accessibilityIdentifier() == "playback-event" }),
+                   let bitmap = button.bitmapImageRepForCachingDisplay(in: button.bounds) {
+                    self.window.effectiveAppearance.performAsCurrentDrawingAppearance { button.cacheDisplay(in: button.bounds, to: bitmap) }
+                    let purple = (0..<bitmap.pixelsWide).contains { x in
+                        (0..<bitmap.pixelsHigh).contains { y in
+                            guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { return false }
+                            return color.redComponent > 0.4 && color.blueComponent > 0.6 && color.greenComponent < 0.6 && color.blueComponent > color.greenComponent + 0.2
+                        }
+                    }
+                    check("motion_list_marker_is_purple", purple)
+                } else { check("motion_list_marker_is_purple", false) }
+                self.saveExperienceScreenshot(directory.appendingPathComponent(restoring ? "restored.png" : "motion-timeline.png"))
+                finish()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
     }
 }

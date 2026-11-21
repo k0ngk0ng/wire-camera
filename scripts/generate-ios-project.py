@@ -20,7 +20,8 @@ def add(object_name, kind, **values):
 
 
 app_files = [str(path.relative_to(root / 'iOS')) for path in sorted((root / 'iOS').glob('*.swift'))]
-app_files += ['../Shared/CameraRemoteCoding.swift', '../Sources/CameraPlaybackDay.swift']
+app_files += ['../' + str(path.relative_to(root)) for path in sorted((root / 'Shared').glob('*.swift'))]
+app_files += ['../Sources/CameraPlaybackDay.swift']
 test_files = ['../Tests/iOS/WireCameraUITests.swift']
 children = []
 
@@ -58,7 +59,7 @@ def configurations(name, settings):
     return add(name + '-configs', 'XCConfigurationList', buildConfigurations=configs, defaultConfigurationIsVisible=0, defaultConfigurationName='Release')
 
 
-app_settings = dict(base_settings, PRODUCT_NAME='WireCamera', PRODUCT_BUNDLE_IDENTIFIER='com.wirecamera.iphone.k0ngk0ng', INFOPLIST_FILE='Info.plist', GENERATE_INFOPLIST_FILE='YES', MARKETING_VERSION='1.0.0', CURRENT_PROJECT_VERSION='1', ASSETCATALOG_COMPILER_APPICON_NAME='AppIcon', SUPPORTS_MACCATALYST='NO')
+app_settings = dict(base_settings, PRODUCT_NAME='WireCamera', PRODUCT_BUNDLE_IDENTIFIER='com.wirecamera.iphone.k0ngk0ng', INFOPLIST_FILE='Info.plist', GENERATE_INFOPLIST_FILE='YES', MARKETING_VERSION='1.1.0', CURRENT_PROJECT_VERSION='2', ASSETCATALOG_COMPILER_APPICON_NAME='AppIcon', SUPPORTS_MACCATALYST='NO')
 test_settings = dict(base_settings, PRODUCT_NAME='$(TARGET_NAME)', PRODUCT_BUNDLE_IDENTIFIER='com.wirecamera.iphone.k0ngk0ng.uitests', GENERATE_INFOPLIST_FILE='YES', TEST_TARGET_NAME='WireCamera')
 app_target = add('app-target', 'PBXNativeTarget', name='WireCamera', buildConfigurationList=configurations('app', app_settings), buildPhases=[app_sources, resources], buildRules=[], dependencies=[], productName='WireCamera', productReference=app_product, productType='com.apple.product-type.application')
 proxy = add('test-proxy', 'PBXContainerItemProxy', containerPortal=identifier('project'), proxyType=1, remoteGlobalIDString=app_target, remoteInfo='WireCamera')

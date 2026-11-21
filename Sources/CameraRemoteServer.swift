@@ -14,11 +14,19 @@ private final class CameraRemotePeer {
     init(_ connection: NWConnection) { self.connection = connection }
 }
 
+private struct CameraRemotePlaybackLease {
+    let recordingID: String
+    let owner: String
+    let access: CameraRecordingAccess
+    var expires: Date
+}
+
 final class CameraRemoteServer {
     private let queue = DispatchQueue(label: "camera.remote-server")
     private var listener: NWListener?
     private var peers: [UUID: CameraRemotePeer] = [:]
     private var challenges: [String: Date] = [:]
+    private var playbackLeases: [String: CameraRemotePlaybackLease] = [:]
     private var attempts: [String: [Date]] = [:]
     private var password = ""
     private var fingerprint = ""
@@ -56,6 +64,7 @@ final class CameraRemoteServer {
         timer.schedule(deadline: .now() + 3, repeating: 3)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
+            self.playbackLeases = self.playbackLeases.filter { $0.value.expires > Date() }
             for peer in self.peers.values where peer.sourceID != nil { self.stream(Data(), kind: 0, to: peer) }
         }
         timer.resume()
@@ -68,6 +77,7 @@ final class CameraRemoteServer {
             self.heartbeat?.cancel(); self.heartbeat = nil
             for peer in Array(self.peers.values) { self.close(peer) }
             self.challenges.removeAll()
+            self.playbackLeases.removeAll()
         }
     }
 
@@ -120,7 +130,7 @@ final class CameraRemoteServer {
                 guard let header = String(data: peer.buffer[..<end.lowerBound], encoding: .utf8) else { self.respond(peer, status: 400); return }
                 let lines = header.components(separatedBy: "\r\n")
                 let first = lines[0].split(separator: " ")
-                guard first.count == 3, ["GET", "POST", "HEAD"].contains(String(first[0])), first[2] == "HTTP/1.1" else { self.respond(peer, status: 400); return }
+                guard first.count == 3, ["GET", "POST", "HEAD", "PUT", "DELETE"].contains(String(first[0])), first[2] == "HTTP/1.1" else { self.respond(peer, status: 400); return }
                 var headers: [String: String] = [:]
                 for line in lines.dropFirst() {
                     guard let colon = line.firstIndex(of: ":") else { self.respond(peer, status: 400); return }
@@ -165,6 +175,33 @@ final class CameraRemoteServer {
             return
         }
         guard let authorization = headers["authorization"], authorization.hasPrefix("Bearer "), validToken(String(authorization.dropFirst(7))) else { respond(peer, status: 401); return }
+        let components = path.split(separator: "/")
+        if components.count == 3, components[0] == "v1", components[1] == "playback", method == "PUT" || method == "DELETE" {
+            let id = String(components[2])
+            guard var lease = playbackLeases[id] else { respond(peer, status: method == "DELETE" ? 204 : 410); return }
+            guard lease.owner == authorization else { respond(peer, status: 403); return }
+            if method == "DELETE" { playbackLeases.removeValue(forKey: id) }
+            else { lease.expires = Date().addingTimeInterval(45); playbackLeases[id] = lease }
+            respond(peer, status: 204)
+            return
+        }
+        if components.count == 4, components[0] == "v1", components[1] == "recordings", components[3] == "playback", method == "POST", UUID(uuidString: String(components[2])) != nil {
+            guard playbackLeases.count < 64 else { respond(peer, status: 429); return }
+            let id = String(components[2])
+            DispatchQueue.main.async {
+                let entry = self.onRecordings?().first { $0.id == id }
+                let access = entry.flatMap { self.onMovieAccess?($0) ?? nil }
+                self.queue.async {
+                    guard !peer.closed else { return }
+                    guard let access else { self.respond(peer, status: 404); return }
+                    guard self.playbackLeases.count < 64 else { self.respond(peer, status: 429); return }
+                    let token = CameraRemoteCoding.randomSecret()
+                    self.playbackLeases[token] = CameraRemotePlaybackLease(recordingID: id, owner: authorization, access: access, expires: Date().addingTimeInterval(45))
+                    self.json(peer, value: CameraPlaybackTicket(id: token, expiresIn: 45))
+                }
+            }
+            return
+        }
         guard method == "GET" || method == "HEAD" else { respond(peer, status: 405); return }
         let sourceID = url.queryItems?.first { $0.name == "sourceID" }?.value
         if path == "/v1/cameras" {
@@ -195,6 +232,14 @@ final class CameraRemoteServer {
             let components = path.split(separator: "/")
             guard components.count == 4, components[0] == "v1", components[1] == "recordings", components[3] == "movie", UUID(uuidString: String(components[2])) != nil else { respond(peer, status: 404); return }
             let id = String(components[2])
+            if let token = headers["x-wirecamera-playback"] {
+                guard var lease = playbackLeases[token], lease.expires > Date() else { respond(peer, status: 410); return }
+                guard lease.owner == authorization && lease.recordingID == id else { respond(peer, status: 403); return }
+                lease.expires = Date().addingTimeInterval(45); playbackLeases[token] = lease
+                peer.access = lease.access
+                movie(peer, url: lease.access.url, range: headers["range"], head: method == "HEAD")
+                return
+            }
             DispatchQueue.main.async {
                 let entry = self.onRecordings?().first { $0.id == id }
                 let access = entry.flatMap { self.onMovieAccess?($0) ?? nil }

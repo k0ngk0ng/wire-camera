@@ -12,5 +12,10 @@ APP_PATH="$PWD/.build/ios-derived/Build/Products/Release-iphoneos/WireCamera.app
 codesign --verify --deep --strict "$APP_PATH"
 xcrun devicectl device install app --device "$DEVICE_ID" "$APP_PATH" > "$RUN_DIR/install.log" 2>&1
 xcrun devicectl device process launch --device "$DEVICE_ID" com.wirecamera.iphone.k0ngk0ng > "$RUN_DIR/launch.log" 2>&1
-printf '{"passed":true,"installed":true,"launched":true,"version":"1.0.0"}\n' > "$RUN_DIR/report.json"
+plutil -extract CFBundleShortVersionString raw "$APP_PATH/Info.plist" > "$RUN_DIR/version.txt"
+python3 - "$RUN_DIR" <<'PY'
+import json,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+(root/'report.json').write_text(json.dumps({'passed':True,'installed':True,'launched':True,'version':(root/'version.txt').read_text().strip()}))
+PY
 printf 'Artifacts: %s\n' "$RUN_DIR"

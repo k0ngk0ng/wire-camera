@@ -24,11 +24,16 @@ final class CameraPhoneModel: ObservableObject {
     @Published var playing = false
     @Published var muted = false
     @Published var timelineSpan = 86400.0
+    @Published var eventFilter = CameraPlaybackEventFilter.all
+    var activityEvents: [CameraPlaybackEvent] { day.events(matching: eventFilter) }
     let player = AVQueuePlayer()
     private var client: CameraRemoteClient?
     private var stream: CameraLiveStream?
     private var loadTask: Task<Void, Never>?
-    private var nextTask: Task<Void, Never>?
+    private var resources: [ObjectIdentifier: CameraPlaybackResource] = [:]
+    private var playbackRequested = false
+    private var playerStateObserver: NSKeyValueObservation?
+    private var itemStatusObserver: NSKeyValueObservation?
     private var refreshTask: Task<Void, Never>?
     private var generation = UUID()
     private var itemEntries: [ObjectIdentifier: CameraRecording] = [:]
@@ -43,6 +48,14 @@ final class CameraPhoneModel: ObservableObject {
     var availableDates: [Date] { CameraPlaybackDay.availableDates(recordings: recordings.filter { $0.sourceID == selectedID }) }
 
     init() {
+        player.automaticallyWaitsToMinimizeStalling = false
+        playerStateObserver = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
+            Task { @MainActor in
+                guard let self, self.playbackMode else { return }
+                self.loading = self.playbackRequested && player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+                self.playing = player.timeControlStatus == .playing
+            }
+        }
         timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { [weak self] time in
             Task { @MainActor in
                 guard let self else { return }
@@ -54,6 +67,17 @@ final class CameraPhoneModel: ObservableObject {
             Task { @MainActor in
                 guard let self, let item = player.currentItem, let recording = self.itemEntries[ObjectIdentifier(item)] else { return }
                 self.currentRecording = recording
+                let retained = Set(player.items().map { ObjectIdentifier($0) })
+                for id in Array(self.resources.keys) where !retained.contains(id) { self.resources.removeValue(forKey: id)?.close(); self.itemEntries.removeValue(forKey: id) }
+                self.itemStatusObserver = item.observe(\.status, options: [.initial, .new]) { [weak self, weak item] _, _ in
+                    Task { @MainActor in
+                        guard let self, let item, self.player.currentItem === item, item.status == .failed else { return }
+                        self.loading = false; self.playing = false; self.playbackRequested = false
+                        self.error = "录像加载失败：" + (item.error?.localizedDescription ?? "请重新点击时间轴。")
+                        self.player.pause()
+                        self.resources.removeValue(forKey: ObjectIdentifier(item))?.close()
+                    }
+                }
                 self.queueNext(after: recording)
             }
         }
@@ -152,15 +176,19 @@ final class CameraPhoneModel: ObservableObject {
         else { cursor = target; error = "这个时间之后没有已保存的录像。" }
     }
 
-    func nextPerson() {
-        if let event = day.personIntervals.first(where: { $0.start > cursor.addingTimeInterval(1) }) { seek(event.start) }
-        else if let first = day.personIntervals.first { seek(first.start) }
+    func nextEvent() {
+        if let event = activityEvents.first(where: { $0.start > cursor.addingTimeInterval(1) }) { seek(event.start) }
+        else if let first = activityEvents.first { seek(first.start) }
     }
 
     func togglePlayback() {
         if playbackMode {
-            if player.rate > 0 { player.pause(); playing = false }
-            else if player.currentItem != nil { player.play(); playing = true }
+            if playbackRequested {
+                playbackRequested = false; player.pause(); playing = false; loading = false
+                resources.values.forEach { $0.setSuspended(true) }
+            } else if let currentRecording {
+                play(currentRecording, offset: player.currentTime().seconds.isFinite ? player.currentTime().seconds : 0)
+            }
         } else if stream != nil { stopLive() }
         else { startLive() }
     }
@@ -170,8 +198,12 @@ final class CameraPhoneModel: ObservableObject {
     func setActive(_ value: Bool) {
         guard value != active else { return }
         active = value
-        if !value { stopLive(); player.pause(); playing = false }
+        if !value {
+            stopLive(); player.pause(); playing = false; loading = false
+            resources.values.forEach { $0.setSuspended(true, keepLease: false) }
+        }
         else if connected && !playbackMode { startLive() }
+        else if connected && playbackMode && playbackRequested { resources.values.forEach { $0.setSuspended(false) }; player.play() }
     }
 
     func applyPairingURL(_ url: URL) -> Bool {
@@ -225,7 +257,8 @@ final class CameraPhoneModel: ObservableObject {
     }
 
     private func clearPlayback() {
-        generation = UUID(); loadTask?.cancel(); nextTask?.cancel()
+        generation = UUID(); loadTask?.cancel(); playbackRequested = false
+        resources.values.forEach { $0.close() }; resources.removeAll(); itemStatusObserver = nil
         player.pause(); player.removeAllItems(); itemEntries.removeAll(); currentRecording = nil
         playing = false; loading = false
     }
@@ -236,18 +269,17 @@ final class CameraPhoneModel: ObservableObject {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
             try AVAudioSession.sharedInstance().setActive(true)
         } catch { self.error = "无法播放摄像头声音：" + error.localizedDescription; return }
-        if currentRecording?.id == recording.id {
+        if currentRecording?.id == recording.id, let item = player.currentItem, resources[ObjectIdentifier(item)] != nil, item.status != .failed {
+            playbackRequested = true; resources.values.forEach { $0.setSuspended(false) }
             player.seek(to: CMTime(seconds: offset, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
             player.play(); playing = true; error = nil; return
         }
-        clearPlayback(); loading = true; error = nil
+        clearPlayback(); loading = true; error = nil; playbackRequested = true
         let current = generation
         loadTask = Task {
             do {
-                let url = try await client.download(recording)
-                try Task.checkCancellation()
                 guard generation == current else { return }
-                let item = AVPlayerItem(url: url)
+                let item = try self.playbackItem(recording, client: client, generation: current)
                 itemEntries[ObjectIdentifier(item)] = recording
                 currentRecording = recording
                 player.insert(item, after: nil)
@@ -257,24 +289,36 @@ final class CameraPhoneModel: ObservableObject {
                 queueNext(after: recording)
             } catch {
                 guard generation == current, !Task.isCancelled else { return }
-                loading = false; self.error = "录像加载失败：" + error.localizedDescription
+                loading = false; playbackRequested = false; self.error = "录像加载失败：" + error.localizedDescription
             }
         }
     }
 
     private func queueNext(after recording: CameraRecording) {
         guard let client, let next = day.recordings.first(where: { $0.startedAt > recording.startedAt }), player.items().count < 2 else { return }
-        nextTask?.cancel()
-        let current = generation
-        nextTask = Task {
-            do {
-                let url = try await client.download(next)
-                try Task.checkCancellation()
-                guard generation == current, currentRecording?.id == recording.id, player.items().count < 2 else { return }
-                let item = AVPlayerItem(url: url)
-                itemEntries[ObjectIdentifier(item)] = next
-                player.insert(item, after: player.items().last)
-            } catch { if !Task.isCancelled && generation == current { self.error = "下一段录像加载失败，可点击时间轴重试。" } }
+        do {
+            let item = try playbackItem(next, client: client, generation: generation)
+            itemEntries[ObjectIdentifier(item)] = next
+            player.insert(item, after: player.items().last)
+        } catch { self.error = "下一段录像加载失败，可点击时间轴重试。" }
+    }
+
+    private func playbackItem(_ recording: CameraRecording, client: CameraRemoteClient, generation current: UUID) throws -> AVPlayerItem {
+        let resource = try client.playbackResource(recording)
+        let item = resource.makeItem()
+        let id = ObjectIdentifier(item)
+        resources[id] = resource
+        if !playbackRequested { resource.setSuspended(true) }
+        resource.onError = { [weak self, weak item, weak resource] error in
+            Task { @MainActor in
+                guard let self, let item, let resource, self.generation == current, self.resources[id] === resource else { return }
+                self.resources.removeValue(forKey: id)?.close()
+                if self.player.currentItem === item {
+                    self.loading = false; self.playing = false; self.playbackRequested = false; self.player.pause()
+                    self.error = "录像读取失败：" + error.localizedDescription
+                } else { self.player.remove(item); self.error = "下一段录像读取失败，可点击时间轴重试。" }
+            }
         }
+        return item
     }
 }

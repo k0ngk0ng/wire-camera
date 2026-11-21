@@ -21,6 +21,8 @@ struct CameraPhoneTimeline: View {
                 Spacer()
                 Circle().fill(.orange).frame(width: 6, height: 6)
                 Text("有人").font(.caption).foregroundStyle(.secondary)
+                Circle().fill(.purple).frame(width: 6, height: 6)
+                Text("画面变化").font(.caption).foregroundStyle(.secondary)
                 Button { zoom(2) } label: { Image(systemName: "minus.magnifyingglass") }
                     .accessibilityLabel("缩小时间轴")
                 Button { zoom(0.5) } label: { Image(systemName: "plus.magnifyingglass") }
@@ -36,9 +38,9 @@ struct CameraPhoneTimeline: View {
                     let last = min(size.width, x(recording.startedAt.addingTimeInterval(recording.duration)))
                     if last > first { context.fill(Path(CGRect(x: first, y: 22, width: max(2, last - first), height: 20)), with: .color(.cyan.opacity(0.65))) }
                 }
-                for event in model.day.personIntervals where event.end >= interval.start && event.start <= interval.end {
+                for event in model.activityEvents.reversed() where event.end >= interval.start && event.start <= interval.end {
                     let point = max(3, min(size.width - 3, x(event.start)))
-                    context.fill(Path(ellipseIn: CGRect(x: point - 3, y: 8, width: 6, height: 6)), with: .color(.orange))
+                    context.fill(Path(ellipseIn: CGRect(x: point - 3, y: 8, width: 6, height: 6)), with: .color(event.isPerson ? .orange : .purple))
                 }
                 for step in 0...4 {
                     let date = interval.start.addingTimeInterval(Double(step) * interval.duration / 4)
@@ -68,13 +70,16 @@ struct CameraPhoneTimeline: View {
             .accessibilityLabel("全天时间轴")
             .accessibilityIdentifier("全天时间轴")
             .accessibilityValue(model.cursor.formatted(date: .omitted, time: .standard))
-            if showsEvents && !model.day.personIntervals.isEmpty {
+            if showsEvents {
+                CameraPhoneEventFilter(model: model)
+            }
+            if showsEvents && !model.activityEvents.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 12) {
-                        ForEach(model.day.personIntervals, id: \.start) { event in
+                        ForEach(model.activityEvents, id: \.start) { event in
                             Button { model.seek(event.start) } label: {
                                 HStack(spacing: 6) {
-                                    Circle().fill(.orange).frame(width: 6, height: 6)
+                                    Circle().fill(event.isPerson ? .orange : .purple).frame(width: 6, height: 6)
                                     Text(event.start, format: .dateTime.hour().minute().second()).font(.caption.monospacedDigit())
                                 }.padding(.horizontal, 10).padding(.vertical, 8).background(.white.opacity(0.06), in: Capsule())
                             }
@@ -90,5 +95,15 @@ struct CameraPhoneTimeline: View {
     private func zoom(_ factor: Double) {
         center = model.cursor
         model.timelineSpan = min(model.day.interval.duration, max(300, model.timelineSpan * factor))
+    }
+}
+
+
+struct CameraPhoneEventFilter: View {
+    @ObservedObject var model: CameraPhoneModel
+    var body: some View {
+        Picker("活动筛选", selection: $model.eventFilter) {
+            ForEach(CameraPlaybackEventFilter.allCases, id: \.rawValue) { filter in Text(filter.title).tag(filter) }
+        }.pickerStyle(.segmented).accessibilityIdentifier("活动筛选")
     }
 }

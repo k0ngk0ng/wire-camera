@@ -54,6 +54,9 @@ if mode == 'first':
     status, data, _ = request('/v1/pair', method='POST', body={'nonce': challenge['nonce'], 'proof': proof('client|' + challenge['nonce'] + '|' + fingerprint)})
     assert status == 200
     token = json.loads(data)['token']
+    lease_status, lease_data, _ = request('/v1/recordings/' + manifest['movies']['leased'] + '/playback', token, method='POST')
+    assert lease_status == 200
+    lease_id = json.loads(lease_data)['id']
     (root / 'client-session.json').write_text(json.dumps({'token': token, 'fingerprint': fingerprint}))
     connection = http.client.HTTPSConnection('127.0.0.1', ready['port'], context=context, timeout=15)
     connection.request('GET', '/v1/recordings/' + manifest['movies']['downloading'] + '/movie', headers={'Authorization': 'Bearer ' + token})
@@ -66,6 +69,7 @@ if mode == 'first':
     assert response.read(64)
     response.close()
     connection.close()
+    assert request('/v1/playback/' + lease_id, token, method='DELETE')[0] == 204
     (root / 'client-released').write_text('released')
 else:
     session = json.loads((root / 'client-session.json').read_text())

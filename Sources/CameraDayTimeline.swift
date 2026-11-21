@@ -8,6 +8,8 @@ final class CameraDayTimeline: NSControl {
     private var position: Double = 0
     private var recordedIntervals: [DateInterval] = []
     private(set) var personIntervals: [DateInterval] = []
+    private var motionIntervals: [DateInterval] = []
+    var eventFilter = CameraPlaybackEventFilter.all { didSet { needsDisplay = true } }
     private(set) var isTracking = false
     var followsPlayback = true
     private var hover: Date?
@@ -41,6 +43,7 @@ final class CameraDayTimeline: NSControl {
             return start < end ? DateInterval(start: start, end: end) : nil
         }
         personIntervals = day.personIntervals
+        motionIntervals = day.motionIntervals
         if reset { visibleStart = 0; visibleDuration = day.interval.duration; position = 0; followsPlayback = true }
         isEnabled = !day.recordings.isEmpty
         needsDisplay = true
@@ -136,10 +139,11 @@ final class CameraDayTimeline: NSControl {
             NSColor.controlAccentColor.withAlphaComponent(0.85).setFill()
             NSRect(x: left, y: 27, width: max(2, right - left), height: 13).fill()
         }
-        for interval in personIntervals {
+        let markers: [(DateInterval, NSColor)] = (eventFilter == .person ? [] : motionIntervals.map { ($0, NSColor.systemPurple) }) + (eventFilter == .motion ? [] : personIntervals.map { ($0, NSColor.systemOrange) })
+        for (interval, color) in markers {
             let left = max(16, x(for: interval.start)), right = min(bounds.width - 16, x(for: interval.end))
             guard right >= left, x(for: interval.end) >= 16, x(for: interval.start) <= bounds.width - 16 else { continue }
-            NSColor.systemOrange.setFill()
+            color.setFill()
             NSBezierPath(ovalIn: NSRect(x: left - 3, y: 45, width: 6, height: 6)).fill()
         }
         let desired = visibleDuration / max(1, Double(width / 90))
@@ -164,10 +168,12 @@ final class CameraDayTimeline: NSControl {
         ("录像" as NSString).draw(at: NSPoint(x: 29, y: 58), withAttributes: legendAttributes)
         NSColor.systemOrange.setFill(); NSBezierPath(ovalIn: NSRect(x: 66, y: 62, width: 6, height: 6)).fill()
         ("有人" as NSString).draw(at: NSPoint(x: 77, y: 58), withAttributes: legendAttributes)
+        NSColor.systemPurple.setFill(); NSBezierPath(ovalIn: NSRect(x: 112, y: 62, width: 6, height: 6)).fill()
+        ("画面变化" as NSString).draw(at: NSPoint(x: 123, y: 58), withAttributes: legendAttributes)
         if let hover {
             let text = hover.formatted(.dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits).second(.twoDigits))
             let size = (text as NSString).size(withAttributes: attributes)
-            (text as NSString).draw(at: NSPoint(x: min(bounds.width - size.width - 4, max(115, x(for: hover) - size.width / 2)), y: 58), withAttributes: attributes)
+            (text as NSString).draw(at: NSPoint(x: min(bounds.width - size.width - 4, max(183, x(for: hover) - size.width / 2)), y: 58), withAttributes: attributes)
         }
     }
 }

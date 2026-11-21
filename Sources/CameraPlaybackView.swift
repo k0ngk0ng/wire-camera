@@ -26,6 +26,8 @@ final class CameraPlaybackView: NSView {
     private let playerView = CameraPlaybackSurface(frame: .zero)
     private let datePicker = NSPopUpButton()
     private let eventList = CameraPlaybackList()
+    private let eventFilter = NSSegmentedControl(labels: ["全部", "有人", "变化"], trackingMode: .selectOne, target: nil, action: nil)
+    private var filteredEvents: [CameraPlaybackEvent] { schedule?.events(matching: CameraPlaybackEventFilter(rawValue: eventFilter.selectedSegment) ?? .all) ?? [] }
     private let timeline = CameraDayTimeline(frame: .zero)
     private let zoomPicker = NSSegmentedControl(labels: ["全天", "6 小时", "1 小时", "15 分钟"], trackingMode: .selectOne, target: nil, action: nil)
     private let timeLabel = NSTextField(labelWithString: "00:00:00")
@@ -71,8 +73,13 @@ final class CameraPlaybackView: NSView {
         let toolbar = NSView()
         let eventsPanel = NSView()
         let transport = NSView()
-        let eventsTitle = NSTextField(labelWithString: "人物出现")
-        eventsTitle.font = .systemFont(ofSize: 15, weight: .semibold)
+        let eventsTitle = eventFilter
+        eventFilter.selectedSegment = 0
+        eventFilter.segmentStyle = .rounded
+        eventFilter.target = self
+        eventFilter.action = #selector(changeEventFilter)
+        eventFilter.setAccessibilityLabel("活动筛选")
+        eventFilter.setAccessibilityIdentifier("playback-event-filter")
         datePicker.target = self
         datePicker.action = #selector(changeDate)
         datePicker.setAccessibilityLabel("回放日期")
@@ -204,7 +211,7 @@ final class CameraPlaybackView: NSView {
     }
 
     func performFirstEventJump() -> Bool {
-        guard let event = schedule?.personIntervals.first, let button = eventList.arrangedSubviews.first as? NSButton else { return false }
+        guard let event = filteredEvents.first, let button = eventList.arrangedSubviews.compactMap({ $0 as? NSButton }).first(where: { $0.accessibilityIdentifier() == "playback-event" }) else { return false }
         button.performClick(nil)
         return abs(timeline.doubleValue - event.start.timeIntervalSince(timeline.dayStart)) < 0.01
     }
@@ -272,21 +279,31 @@ final class CameraPlaybackView: NSView {
 
     private func updateEvents() {
         for view in eventList.arrangedSubviews { eventList.removeArrangedSubview(view); view.removeFromSuperview() }
-        guard let schedule else { return }
-        let pending = visible.contains { $0.indexState == "processing" }
-        let failed = visible.contains { $0.indexState == "failed" }
-        eventStatus.stringValue = schedule.personIntervals.isEmpty ? (pending ? "正在识别人物…" : (failed ? "人物识别未完成" : "未检测到人物")) : "\(schedule.personIntervals.count) 段人物活动" + (pending ? " · 识别中" : "")
-        if failed { eventList.addArrangedSubview(NSButton(title: "重新识别", target: self, action: #selector(retryIndex))) }
-        for (index, event) in schedule.personIntervals.enumerated() {
+        guard schedule != nil else { return }
+        let pending = visible.contains { $0.indexState == "processing" || $0.motionIndexState == nil || $0.motionIndexState == "processing" }
+        let failed = visible.contains { $0.indexState == "failed" || $0.motionIndexState == "failed" }
+        let events = filteredEvents
+        eventStatus.stringValue = events.isEmpty ? (pending ? "正在分析…" : (failed ? "分析未完成" : "没有匹配的活动")) : "\(events.count) 段活动" + (pending ? " · 分析中" : "")
+        if failed { eventList.addArrangedSubview(NSButton(title: "重新分析", target: self, action: #selector(retryIndex))) }
+        for (index, event) in events.enumerated() {
             let button = NSButton(title: Self.clock(event.start) + " – " + Self.clock(event.end), target: self, action: #selector(jumpToEvent(_:)))
             button.tag = index
             button.bezelStyle = .rounded
-            button.image = NSImage(systemSymbolName: "figure.walk", accessibilityDescription: nil)
+            let color: NSColor = event.isPerson ? .systemOrange : .systemPurple
+            button.image = NSImage(size: NSSize(width: 8, height: 8), flipped: false) { rect in
+                color.setFill(); NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1)).fill(); return true
+            }
             button.imagePosition = .imageLeading
-            button.contentTintColor = .systemOrange
-            button.setAccessibilityLabel("有人出现，跳转至 " + Self.clock(event.start))
+            button.toolTip = event.label
+            button.setAccessibilityLabel(event.label + "，跳转至 " + Self.clock(event.start))
+            button.setAccessibilityIdentifier("playback-event")
             eventList.addArrangedSubview(button)
         }
+    }
+
+    @objc private func changeEventFilter() {
+        timeline.eventFilter = CameraPlaybackEventFilter(rawValue: eventFilter.selectedSegment) ?? .all
+        updateEvents()
     }
 
     private func configure(_ button: NSButton, symbol: String, label: String, action: Selector, identifier: String) {
@@ -354,7 +371,7 @@ final class CameraPlaybackView: NSView {
         day = dates[datePicker.indexOfSelectedItem]; cursor = nil; clearSelection(); update(library: library, sourceID: sourceID); selectFirstRecording()
     }
     @objc private func seekTimeline() { seek(to: timeline.dayStart.addingTimeInterval(timeline.doubleValue)) }
-    @objc private func jumpToEvent(_ sender: NSButton) { guard let events = schedule?.personIntervals, events.indices.contains(sender.tag) else { return }; seek(to: events[sender.tag].start, snapForward: true) }
-    @objc private func retryIndex() { for entry in visible where entry.indexState == "failed" { library?.index(entry) } }
+    @objc private func jumpToEvent(_ sender: NSButton) { let events = filteredEvents; guard events.indices.contains(sender.tag) else { return }; seek(to: events[sender.tag].start, snapForward: true) }
+    @objc private func retryIndex() { for entry in visible where entry.indexState == "failed" || entry.motionIndexState == "failed" { library?.index(entry) } }
     private static func clock(_ date: Date) -> String { let formatter = DateFormatter(); formatter.dateFormat = "HH:mm:ss"; return formatter.string(from: date) }
 }

@@ -16,7 +16,7 @@ with socket.socket() as endpoint:
 base=root/'base.mov'
 subprocess.run(['ffmpeg','-v','error','-loop','1','-i','Tests/Fixtures/person-frame.jpg','-f','lavfi','-i','sine=frequency=500:sample_rate=8000','-t','3','-r','5','-c:v','libx264','-pix_fmt','yuv420p','-c:a','aac',str(base)],check=True)
 movies={}
-offsets={'old':cutoff-4,'exact':cutoff-3,'cross':cutoff-2,'recent':now-3600,'future':now+86400,'playing':cutoff-86400,'downloading':cutoff-86400,'indexing':cutoff-86400,'locked':cutoff-86400,'symlink':cutoff-86400}
+offsets={'old':cutoff-4,'exact':cutoff-3,'cross':cutoff-2,'recent':now-3600,'future':now+86400,'playing':cutoff-86400,'downloading':cutoff-86400,'leased':cutoff-86400,'indexing':cutoff-86400,'locked':cutoff-86400,'symlink':cutoff-86400}
 for name,started in offsets.items():
     identifier=str(uuid.uuid4()).upper()
     movie=root/'library'/(identifier+'.mov')
